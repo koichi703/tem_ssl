@@ -261,3 +261,25 @@ def test_distinguishing_decimals_returns_none_past_the_cap():
 def test_distinguishing_decimals_single_value():
     import numpy as np
     assert vc._distinguishing_decimals(np.array([1.0]), start=4) == 4
+
+
+def test_histogram_never_rounds_a_positive_center_to_zero():
+    # Codex-reported case: 4-decimal rounding turned a finite positive center
+    # (~5.6e-9) into 0.0, which was merely "unique" from its neighbour, not
+    # a value that ever belonged to the histogram.
+    h = vc.bragg_histogram([1e-10, 1e-3], bins=2)
+    assert (h["bragg_ratio"] > 0).all()
+    assert h["bragg_ratio"].nunique() == len(h) == 2
+
+
+def test_histogram_keeps_extreme_finite_centers_finite():
+    h = vc.bragg_histogram([1e300, 1e301], bins=3)
+    assert np.isfinite(h["bragg_ratio"]).all()
+    assert h["bragg_ratio"].nunique() == len(h) == 3
+
+
+def test_distinguishing_decimals_rejects_a_round_to_zero():
+    values = np.array([5.6e-9, 1.78e-5])
+    d = vc._distinguishing_decimals(values, start=4)
+    assert d is not None
+    assert not np.any(np.round(values, d) == 0)

@@ -243,10 +243,19 @@ def band_by_source(
 def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) -> int | None:
     """
     Fewest decimal places (at least `start`, for readability) that keep every
-    value in `values` distinct after rounding, or None when no count up to
-    `cap` does. Histogram bin centers are already sorted and unique before
-    rounding, so this only widens the precision when a fixed decimal count
-    would otherwise merge adjacent bins.
+    value in `values` distinct, finite, and sign-preserving after rounding,
+    or None when no count up to `cap` does. Histogram bin centers are already
+    sorted, unique, and finite before rounding, so this only widens the
+    precision when a fixed decimal count would otherwise merge, zero out, or
+    overflow one of them.
+
+    Distinctness alone is not enough: rounding a tiny positive center like
+    5.6e-9 to 4 decimals gives exactly 0.0, which is both a different value
+    from a nonzero neighbour (so the old uniqueness-only check accepted it)
+    and a wrong one -- a positive score has no business becoming zero. The
+    same reasoning bars rounding a finite value to +/-inf, which np.round
+    will not itself produce but a caller-supplied cap could invite if this
+    function is reused for values near float64's range limits.
 
     Returning `cap` on failure used to still round -- and could still merge
     bins nothing forced together, since values close enough that rounding
@@ -257,9 +266,16 @@ def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) 
     n = len(values)
     if n <= 1:
         return start
+    nonzero = values != 0
     for d in range(start, cap + 1):
-        if len(np.unique(np.round(values, d))) == n:
-            return d
+        rounded = np.round(values, d)
+        if len(np.unique(rounded)) != n:
+            continue
+        if not np.all(np.isfinite(rounded)):
+            continue
+        if np.any(nonzero & (rounded == 0)):
+            continue
+        return d
     return None
 
 
