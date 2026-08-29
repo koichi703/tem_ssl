@@ -1622,30 +1622,23 @@ def crystallinity_probe(
         ]
     else:
         # Either there was no split to protect, or its test sources don't
-        # carry both classes under thresholds fit without them. Either way
-        # every source is about to be used for both fitting and evaluation
-        # (leave-one-source-out), so the thresholds must come from *all* of
-        # them too -- refitting here from the untouched df_all, not reusing
-        # the held-out-only cut above, keeps the reported
-        # all-sources-encoder-exposed protocol honest about what it actually
-        # used.
-        fitted = fit_thresholds_and_label(set())
-        if fitted is None:
-            print(f"[{group}] bragg_ratio has no usable spread; skipping probe.")
-            return None
-        df, hi, lo = fitted
-
+        # carry both classes under thresholds fit without them -- and `df`,
+        # `hi`, `lo` above already reflect exactly that fit (non-held-out
+        # sources only; a no-op when holdout is empty). Every source about
+        # to enter this leave-one-source-out sweep is a non-held-out one, so
+        # those SAME thresholds are reused rather than refit from df_all: a
+        # refit against the full pool would let a held-out source's own
+        # score distribution still influence which exposed patches get
+        # labeled or retained here, even after the source itself is dropped
+        # from the frame below -- contradicting a protocol whose name claims
+        # every evaluated source was encoder-exposed.
+        #
         # A source named as `test` in the checkpoint split is genuinely
-        # encoder-held-out, even though the full-pool refit just above can
-        # incidentally give it both classes. Folding it into this LOSO
-        # sweep would report it under the single "all-sources-encoder-
-        # exposed" label and average an out-of-source fold together with
-        # in-sample ones under a name that claims neither is out-of-source.
-        # Drop it here -- neither fit on nor evaluated in this fallback --
-        # rather than mislabel it. (`df` itself is reassigned, not just the
-        # source list used to pick eval_sources, since every downstream
-        # feature matrix and fold index is built from this frame's row
-        # order.)
+        # encoder-held-out, so it is dropped from `df` itself -- not just
+        # from the source list used to pick eval_sources, since every
+        # downstream feature matrix and fold index is built from this
+        # frame's row order -- rather than folded into this LOSO sweep under
+        # a label that claims it was encoder-exposed.
         if holdout:
             df = df[~df["source_id"].isin(holdout)].copy()
 

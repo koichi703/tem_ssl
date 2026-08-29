@@ -51,12 +51,15 @@ def _manifest_row(source_id, patch_id, bragg_ratio):
     }
 
 
-def test_thresholds_refit_from_full_pool_on_loso_fallback(tmp_path):
+def test_thresholds_stay_non_held_out_on_loso_fallback(tmp_path):
     # A checkpoint split exists, but the designated test source's scores are
     # too narrow to carry both classes under a held-out-only threshold, so
-    # the probe must fall back to leave-one-source-out. If the thresholds
-    # were left over from the held-out-only fit (the bug), they would differ
-    # from -- and be stricter than -- what an honest all-source fit gives.
+    # the probe must fall back to leave-one-source-out. The thresholds used
+    # for that fallback must be the SAME non-held-out-only ones already
+    # computed for the encoder-held-out attempt -- not refit from the full
+    # pool (which would let the held-out source's own scores influence which
+    # exposed patches get labeled, even though the source itself is later
+    # dropped from evaluation) and not the full-pool quantiles either.
     rng = np.random.default_rng(0)
     rows = []
     for src in ("s1", "s2", "s3"):
@@ -79,15 +82,15 @@ def test_thresholds_refit_from_full_pool_on_loso_fallback(tmp_path):
 
     full_hi = manifest["bragg_ratio"].quantile(0.85)
     full_lo = manifest["bragg_ratio"].quantile(0.35)
-    stale_hi = manifest.loc[manifest.source_id != "s_test", "bragg_ratio"].quantile(0.85)
-    stale_lo = manifest.loc[manifest.source_id != "s_test", "bragg_ratio"].quantile(0.35)
+    non_held_out_hi = manifest.loc[manifest.source_id != "s_test", "bragg_ratio"].quantile(0.85)
+    non_held_out_lo = manifest.loc[manifest.source_id != "s_test", "bragg_ratio"].quantile(0.35)
 
-    assert row["threshold_hi"] == pytest.approx(full_hi)
-    assert row["threshold_lo"] == pytest.approx(full_lo)
-    # The bug's stale (held-out-only) thresholds must actually differ here,
-    # or this test would pass regardless of which pool was used.
-    assert row["threshold_hi"] != pytest.approx(stale_hi)
-    assert row["threshold_lo"] != pytest.approx(stale_lo)
+    assert row["threshold_hi"] == pytest.approx(non_held_out_hi)
+    assert row["threshold_lo"] == pytest.approx(non_held_out_lo)
+    # A full-pool refit would actually differ here, or this test would pass
+    # regardless of which pool the thresholds came from.
+    assert row["threshold_hi"] != pytest.approx(full_hi)
+    assert row["threshold_lo"] != pytest.approx(full_lo)
 
 
 def test_thresholds_exclude_held_out_source_under_encoder_held_out(tmp_path):
@@ -121,13 +124,15 @@ def test_thresholds_exclude_held_out_source_under_encoder_held_out(tmp_path):
     assert row["threshold_lo"] == pytest.approx(fit_only_lo)
 
 
-def test_held_out_source_excluded_from_loso_fallback_even_if_refit_splits_it(tmp_path):
-    # Codex-reported case: a test source can lack both classes under
-    # held-out-only thresholds (triggering the LOSO fallback) yet gain both
-    # once thresholds are refit from the full pool. Folding it into
-    # "all-sources-encoder-exposed" would silently average a genuinely
-    # out-of-source fold together with in-sample ones under a label that
-    # claims neither is out-of-source.
+def test_held_out_source_never_enters_loso_fallback_evaluation(tmp_path):
+    # A held-out source must never appear in the LOSO fallback's
+    # eval_sources. This used to be reachable two ways: (a) a full-pool
+    # threshold refit could incidentally give a single-class held-out source
+    # both classes, sneaking it into "all-sources-encoder-exposed" (fixed by
+    # reusing the non-held-out-only thresholds instead of refitting); (b) as
+    # a defence regardless of where the thresholds came from, `df` itself
+    # drops any checkpoint-designated held-out source before eval_sources is
+    # computed. This test exercises (b) directly, independent of (a).
     rng = np.random.default_rng(3)
     rows = []
     for src in ("s1", "s2", "s3"):
@@ -139,19 +144,14 @@ def test_held_out_source_excluded_from_loso_fallback_even_if_refit_splits_it(tmp
     manifest = pd.DataFrame(rows)
     ssl_df, hand_df = _feature_frames(manifest, seed=3)
 
-    # Confirm the fixture actually exercises the reported bug: s_test must
-    # be single-class under held-out-only thresholds (forcing the fallback)
-    # and multi-class under a full-pool refit (the trap).
+    # Confirm the fixture forces the fallback: under the non-held-out-only
+    # thresholds that both the encoder-held-out attempt and (per the fix)
+    # the fallback itself use, s_test must be single-class.
     fit_only = manifest.loc[manifest.source_id != "s_test", "bragg_ratio"]
-    held_hi, held_lo = fit_only.quantile(0.85), fit_only.quantile(0.35)
+    hi, lo = fit_only.quantile(0.85), fit_only.quantile(0.35)
     s_test_scores = manifest.loc[manifest.source_id == "s_test", "bragg_ratio"]
-    held_labels = np.where(s_test_scores >= held_hi, 1,
-                           np.where(s_test_scores <= held_lo, 0, -1))
-    assert set(held_labels[held_labels >= 0]) != {0, 1}, "fixture no longer forces the fallback"
-    full_hi, full_lo = manifest["bragg_ratio"].quantile(0.85), manifest["bragg_ratio"].quantile(0.35)
-    full_labels = np.where(s_test_scores >= full_hi, 1,
-                           np.where(s_test_scores <= full_lo, 0, -1))
-    assert set(full_labels[full_labels >= 0]) == {0, 1}, "fixture no longer creates the trap"
+    labels = np.where(s_test_scores >= hi, 1, np.where(s_test_scores <= lo, 0, -1))
+    assert set(labels[labels >= 0]) != {0, 1}, "fixture no longer forces the fallback"
 
     project = _project(tmp_path, manifest, split_rows={
         "source_id": ["s1", "s2", "s3", "s_test"],
