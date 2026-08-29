@@ -121,6 +121,51 @@ def test_thresholds_exclude_held_out_source_under_encoder_held_out(tmp_path):
     assert row["threshold_lo"] == pytest.approx(fit_only_lo)
 
 
+def test_held_out_source_excluded_from_loso_fallback_even_if_refit_splits_it(tmp_path):
+    # Codex-reported case: a test source can lack both classes under
+    # held-out-only thresholds (triggering the LOSO fallback) yet gain both
+    # once thresholds are refit from the full pool. Folding it into
+    # "all-sources-encoder-exposed" would silently average a genuinely
+    # out-of-source fold together with in-sample ones under a label that
+    # claims neither is out-of-source.
+    rng = np.random.default_rng(3)
+    rows = []
+    for src in ("s1", "s2", "s3"):
+        for i, v in enumerate(rng.uniform(90, 110, 15)):
+            rows.append(_manifest_row(src, f"{src}_p{i}", float(v)))
+    s_test_vals = np.concatenate([rng.uniform(0, 5, 10), rng.uniform(100, 106, 10)])
+    for i, v in enumerate(s_test_vals):
+        rows.append(_manifest_row("s_test", f"s_test_p{i}", float(v)))
+    manifest = pd.DataFrame(rows)
+    ssl_df, hand_df = _feature_frames(manifest, seed=3)
+
+    # Confirm the fixture actually exercises the reported bug: s_test must
+    # be single-class under held-out-only thresholds (forcing the fallback)
+    # and multi-class under a full-pool refit (the trap).
+    fit_only = manifest.loc[manifest.source_id != "s_test", "bragg_ratio"]
+    held_hi, held_lo = fit_only.quantile(0.85), fit_only.quantile(0.35)
+    s_test_scores = manifest.loc[manifest.source_id == "s_test", "bragg_ratio"]
+    held_labels = np.where(s_test_scores >= held_hi, 1,
+                           np.where(s_test_scores <= held_lo, 0, -1))
+    assert set(held_labels[held_labels >= 0]) != {0, 1}, "fixture no longer forces the fallback"
+    full_hi, full_lo = manifest["bragg_ratio"].quantile(0.85), manifest["bragg_ratio"].quantile(0.35)
+    full_labels = np.where(s_test_scores >= full_hi, 1,
+                           np.where(s_test_scores <= full_lo, 0, -1))
+    assert set(full_labels[full_labels >= 0]) == {0, 1}, "fixture no longer creates the trap"
+
+    project = _project(tmp_path, manifest, split_rows={
+        "source_id": ["s1", "s2", "s3", "s_test"],
+        "split": ["train", "train", "val", "test"],
+    })
+
+    probe = T.crystallinity_probe(project, "g", ssl_df, hand_df, METADATA_COLS, 0.85, 0.35)
+    assert probe is not None
+    row = probe.iloc[0]
+    assert row["protocol"] == "all-sources-encoder-exposed"
+    eval_sources = row["eval_sources"].split(";")
+    assert "s_test" not in eval_sources
+
+
 def test_thresholds_use_full_pool_without_any_split(tmp_path):
     # No split_manifest.csv at all: this is the plain LOSO path, where using
     # the full pool was always correct and must remain so.

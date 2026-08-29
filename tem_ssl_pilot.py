@@ -1635,12 +1635,27 @@ def crystallinity_probe(
             return None
         df, hi, lo = fitted
 
+        # A source named as `test` in the checkpoint split is genuinely
+        # encoder-held-out, even though the full-pool refit just above can
+        # incidentally give it both classes. Folding it into this LOSO
+        # sweep would report it under the single "all-sources-encoder-
+        # exposed" label and average an out-of-source fold together with
+        # in-sample ones under a name that claims neither is out-of-source.
+        # Drop it here -- neither fit on nor evaluated in this fallback --
+        # rather than mislabel it. (`df` itself is reassigned, not just the
+        # source list used to pick eval_sources, since every downstream
+        # feature matrix and fold index is built from this frame's row
+        # order.)
+        if holdout:
+            df = df[~df["source_id"].isin(holdout)].copy()
+
         present = set(df["source_id"].unique())
         usable = both_classes(df, sorted(present))
         if len(usable) < 2:
+            suffix = " after excluding held-out sources" if holdout else ""
             print(
-                f"[{group}] fewer than 2 sources contain both classes; "
-                "skipping crystallinity probe."
+                f"[{group}] fewer than 2 sources contain both classes"
+                f"{suffix}; skipping crystallinity probe."
             )
             return None
         protocol = "all-sources-encoder-exposed"
