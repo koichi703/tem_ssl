@@ -65,13 +65,21 @@ thresholds = vc.read_bragg_thresholds(
 )
 bands_on = bool(has_bragg and thresholds)
 
+# A mixed-resolution scale group can hold both scorable and
+# acquisition-Nyquist-unscorable patches (see azimuthal_bragg_score's NaN
+# fallback), so the filter offers BAND_UNSCORED alongside the three real
+# bands -- otherwise those patches would have no offered band that matches
+# and would silently vanish from every filtered view even with everything
+# selected.
+BAND_FILTER_OPTIONS = [*vc.BAND_ORDER, vc.BAND_UNSCORED]
+
 if bands_on:
     hi, lo = thresholds
     gdf[vc.BAND_COLUMN] = vc.classify_bragg_band(gdf["bragg_ratio"], hi, lo)
     selected_bands = st.sidebar.multiselect(
         "Bragg score band",
-        list(vc.BAND_ORDER),
-        default=list(vc.BAND_ORDER),
+        BAND_FILTER_OPTIONS,
+        default=BAND_FILTER_OPTIONS,
         help="Patches と PCA の両方に適用されます。",
     )
     st.sidebar.caption(vc.BRAGG_CAVEAT)
@@ -89,11 +97,9 @@ else:
 
 def apply_band_filter(df: pd.DataFrame) -> pd.DataFrame:
     """Restrict a frame to the selected bands; a no-op when bands are off."""
-    if not bands_on or vc.BAND_COLUMN not in df.columns:
+    if not bands_on:
         return df
-    if not selected_bands:
-        return df.iloc[0:0]
-    return df[df[vc.BAND_COLUMN].isin(selected_bands)]
+    return vc.filter_by_band(df, selected_bands)
 
 
 gdf_view = apply_band_filter(gdf)

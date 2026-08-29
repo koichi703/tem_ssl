@@ -183,6 +183,33 @@ def attach_bragg_columns(
     return left.merge(right, on="patch_id", how="left")
 
 
+def filter_by_band(
+    df: pd.DataFrame | None,
+    selected_bands: Iterable[str],
+    band_col: str = BAND_COLUMN,
+) -> pd.DataFrame:
+    """
+    Restrict a frame to rows whose band is in `selected_bands`.
+
+    A NaN (unscored) row never matches .isin(...) directly -- a mixed-
+    resolution scale group can hold both scorable and
+    acquisition-Nyquist-unscorable patches, and without this, those rows
+    would silently vanish from every filtered view even with every offered
+    band selected. Routing them through BAND_UNSCORED first means selecting
+    it keeps them, and omitting it excludes them like any other band.
+
+    An empty `selected_bands` returns zero rows (nothing was chosen, so
+    nothing matches) rather than the unfiltered frame.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or band_col not in df.columns:
+        return df
+    selected = list(selected_bands)
+    if not selected:
+        return df.iloc[0:0]
+    labels = df[band_col].fillna(BAND_UNSCORED)
+    return df[labels.isin(selected)]
+
+
 def band_summary(
     df: pd.DataFrame | None,
     band_col: str = BAND_COLUMN,

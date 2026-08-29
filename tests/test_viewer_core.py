@@ -181,6 +181,47 @@ def test_band_summary_counts_patches_and_sources_in_fixed_order():
     assert out[out.band == vc.BAND_UNSCORED].iloc[0].patches == 1
 
 
+def test_filter_by_band_keeps_unscored_rows_when_selected():
+    # Codex-reported case: NaN rows in a mixed-resolution scale group must
+    # not vanish from the source picker / PCA scatters even when every
+    # offered band (including "unscored") is selected.
+    df = pd.DataFrame({
+        "patch_id": ["a", "b", "c", "d"],
+        vc.BAND_COLUMN: [vc.BAND_HIGH, vc.BAND_LOW, pd.NA, pd.NA],
+    })
+    out = vc.filter_by_band(df, [*vc.BAND_ORDER, vc.BAND_UNSCORED])
+    assert list(out["patch_id"]) == ["a", "b", "c", "d"]
+
+
+def test_filter_by_band_drops_unscored_rows_when_not_selected():
+    df = pd.DataFrame({
+        "patch_id": ["a", "b", "c"],
+        vc.BAND_COLUMN: [vc.BAND_HIGH, pd.NA, pd.NA],
+    })
+    out = vc.filter_by_band(df, list(vc.BAND_ORDER))
+    assert list(out["patch_id"]) == ["a"]
+
+
+def test_filter_by_band_selects_only_the_named_bands():
+    df = pd.DataFrame({
+        "patch_id": ["a", "b", "c"],
+        vc.BAND_COLUMN: [vc.BAND_HIGH, vc.BAND_AMBIGUOUS, vc.BAND_LOW],
+    })
+    out = vc.filter_by_band(df, [vc.BAND_HIGH, vc.BAND_LOW])
+    assert list(out["patch_id"]) == ["a", "c"]
+
+
+def test_filter_by_band_empty_selection_returns_no_rows():
+    df = pd.DataFrame({"patch_id": ["a"], vc.BAND_COLUMN: [vc.BAND_HIGH]})
+    assert vc.filter_by_band(df, []).empty
+
+
+def test_filter_by_band_missing_column_or_frame_passes_through():
+    df = pd.DataFrame({"patch_id": ["a"]})
+    assert vc.filter_by_band(df, list(vc.BAND_ORDER)) is df
+    assert vc.filter_by_band(None, list(vc.BAND_ORDER)) is None
+
+
 def test_band_summary_without_a_band_column_is_empty_not_an_error():
     assert vc.band_summary(pd.DataFrame({"patch_id": ["a"]})).empty
     assert vc.band_summary(None).empty

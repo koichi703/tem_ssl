@@ -1563,40 +1563,54 @@ def crystallinity_probe(
         except (ValueError, KeyError):
             holdout = set()
 
-    # Thresholds are fit on non-held-out sources only, when there are any;
-    # an empty holdout (no checkpoint split, i.e. the LOSO fallback below)
-    # simply leaves the full pool, which is the only option when there is no
-    # held-out source to protect.
-    fit_mask = (
-        ~df["source_id"].isin(holdout) if holdout
-        else pd.Series(True, index=df.index)
-    )
-    threshold_pool = df.loc[fit_mask, "bragg_ratio"]
-    if threshold_pool.empty:
-        # A holdout covering every source in df leaves nothing to fit from;
-        # fall back to the full pool rather than fail outright.
-        threshold_pool = df["bragg_ratio"]
+    df_all = df
 
-    hi = float(threshold_pool.quantile(hi_quantile))
-    lo = float(threshold_pool.quantile(lo_quantile))
-    if not np.isfinite(hi) or not np.isfinite(lo) or hi <= lo:
-        print(f"[{group}] bragg_ratio has no usable spread; skipping probe.")
-        return None
+    def fit_thresholds_and_label(
+        exclude: set[str],
+    ) -> tuple[pd.DataFrame, float, float] | None:
+        """
+        Quantile-threshold df_all on bragg_ratio from sources outside
+        `exclude`, then label and filter the whole frame by that cut.
 
-    keep = (df["bragg_ratio"] >= hi) | (df["bragg_ratio"] <= lo)
-    df = df[keep].copy()
-    df["label"] = (df["bragg_ratio"] >= hi).astype(int)
+        Returns None when the fit pool -- or the resulting spread -- can't
+        produce usable thresholds.
+        """
+        fit_mask = (
+            ~df_all["source_id"].isin(exclude) if exclude
+            else pd.Series(True, index=df_all.index)
+        )
+        pool = df_all.loc[fit_mask, "bragg_ratio"]
+        if pool.empty:
+            # A holdout covering every source leaves nothing to fit from;
+            # fall back to the full pool rather than fail outright.
+            pool = df_all["bragg_ratio"]
 
-    def both_classes(sources) -> list[str]:
+        hi_ = float(pool.quantile(hi_quantile))
+        lo_ = float(pool.quantile(lo_quantile))
+        if not np.isfinite(hi_) or not np.isfinite(lo_) or hi_ <= lo_:
+            return None
+
+        keep = (df_all["bragg_ratio"] >= hi_) | (df_all["bragg_ratio"] <= lo_)
+        labeled = df_all[keep].copy()
+        labeled["label"] = (labeled["bragg_ratio"] >= hi_).astype(int)
+        return labeled, hi_, lo_
+
+    def both_classes(frame: pd.DataFrame, sources) -> list[str]:
         return [
             str(s) for s in sources
-            if df.loc[df["source_id"] == s, "label"].nunique() == 2
+            if frame.loc[frame["source_id"] == s, "label"].nunique() == 2
         ]
 
-    # The same split is applied to every representation block below, keeping
-    # the reported numbers comparable across them.
+    # First attempt: thresholds fit on non-held-out sources only (a no-op
+    # when there is no checkpoint split, i.e. holdout is empty).
+    fitted = fit_thresholds_and_label(holdout)
+    if fitted is None:
+        print(f"[{group}] bragg_ratio has no usable spread; skipping probe.")
+        return None
+    df, hi, lo = fitted
+
     present = set(df["source_id"].unique())
-    eval_sources = both_classes(sorted(holdout & present))
+    eval_sources = both_classes(df, sorted(holdout & present))
     if eval_sources:
         protocol = "encoder-held-out"
         folds = [
@@ -1607,16 +1621,28 @@ def crystallinity_probe(
             for s in eval_sources
         ]
     else:
-        usable = both_classes(sorted(present))
+        # Either there was no split to protect, or its test sources don't
+        # carry both classes under thresholds fit without them. Either way
+        # every source is about to be used for both fitting and evaluation
+        # (leave-one-source-out), so the thresholds must come from *all* of
+        # them too -- refitting here from the untouched df_all, not reusing
+        # the held-out-only cut above, keeps the reported
+        # all-sources-encoder-exposed protocol honest about what it actually
+        # used.
+        fitted = fit_thresholds_and_label(set())
+        if fitted is None:
+            print(f"[{group}] bragg_ratio has no usable spread; skipping probe.")
+            return None
+        df, hi, lo = fitted
+
+        present = set(df["source_id"].unique())
+        usable = both_classes(df, sorted(present))
         if len(usable) < 2:
             print(
                 f"[{group}] fewer than 2 sources contain both classes; "
                 "skipping crystallinity probe."
             )
             return None
-        # No checkpoint split available (or its test source lacks both
-        # classes): fall back to plain leave-one-source-out and say so, since
-        # the encoder has seen most of these sources.
         protocol = "all-sources-encoder-exposed"
         eval_sources = usable
         folds = [
