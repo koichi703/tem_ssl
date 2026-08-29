@@ -240,13 +240,19 @@ def band_by_source(
     return out.reset_index()
 
 
-def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) -> int:
+def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) -> int | None:
     """
     Fewest decimal places (at least `start`, for readability) that keep every
-    value in `values` distinct after rounding. Histogram bin centers are
-    already sorted and unique before rounding, so this only widens the
-    precision when a fixed decimal count would otherwise merge adjacent bins;
-    `cap` bounds the search at float64's usable precision.
+    value in `values` distinct after rounding, or None when no count up to
+    `cap` does. Histogram bin centers are already sorted and unique before
+    rounding, so this only widens the precision when a fixed decimal count
+    would otherwise merge adjacent bins.
+
+    Returning `cap` on failure used to still round -- and could still merge
+    bins nothing forced together, since values close enough that rounding
+    can't separate them (spacing near float64 epsilon) are usually already
+    distinct unrounded. None tells the caller to skip rounding rather than
+    apply a precision known not to work.
     """
     n = len(values)
     if n <= 1:
@@ -254,7 +260,7 @@ def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) 
     for d in range(start, cap + 1):
         if len(np.unique(np.round(values, d))) == n:
             return d
-    return cap
+    return None
 
 
 def bragg_histogram(
@@ -297,5 +303,8 @@ def bragg_histogram(
     # narrower than that (e.g. scores in [1.0, 1.00001]), so the precision is
     # chosen per call: the fewest decimals -- starting from a readable 4 --
     # that still keeps every bin center distinct.
-    labels = np.round(labels, _distinguishing_decimals(labels, start=4))
+    decimals = _distinguishing_decimals(labels, start=4)
+    if decimals is not None:
+        labels = np.round(labels, decimals)
+    # else: leave the raw floats -- an unreadable tick beats a merged bin.
     return pd.DataFrame({cols[0]: labels, cols[1]: counts})

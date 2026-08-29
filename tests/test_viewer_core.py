@@ -242,3 +242,22 @@ def test_histogram_still_rounds_to_four_decimals_on_an_ordinary_range():
 def test_histogram_widens_precision_only_as_far_as_needed():
     h = vc.bragg_histogram([100.0, 100.0 + 1e-8], bins=4, log=False)
     assert h["bragg_ratio"].nunique() == len(h)
+
+
+def test_histogram_falls_back_to_unrounded_labels_past_the_precision_cap():
+    # Codex-reported case: spacing near float64 epsilon meant no decimal
+    # count up to the cap kept all centers distinct, so the old code rounded
+    # to `cap` anyway and re-collapsed bins that were distinct unrounded.
+    h = vc.bragg_histogram([1.0, 1.0 + 2e-14], bins=40)
+    assert h["bragg_ratio"].nunique() == len(h) == 40
+
+
+def test_distinguishing_decimals_returns_none_past_the_cap():
+    import numpy as np
+    values = np.array([1.0, 1.0 + 1e-16])
+    assert vc._distinguishing_decimals(values, start=4, cap=15) is None
+
+
+def test_distinguishing_decimals_single_value():
+    import numpy as np
+    assert vc._distinguishing_decimals(np.array([1.0]), start=4) == 4
