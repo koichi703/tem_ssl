@@ -262,10 +262,14 @@ def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) 
     can't separate them (spacing near float64 epsilon) are usually already
     distinct unrounded. None tells the caller to skip rounding rather than
     apply a precision known not to work.
+
+    A single value is not exempt from the finite/nonzero check just because
+    it cannot collide with a neighbour: an early return here for n <= 1 used
+    to skip the loop entirely, so bragg_histogram([1e-10], bins=1) rounded
+    its only center straight to 0.0 with no check that ever caught it. It now
+    runs through the same loop as every other length.
     """
     n = len(values)
-    if n <= 1:
-        return start
     nonzero = values != 0
     for d in range(start, cap + 1):
         rounded = np.round(values, d)

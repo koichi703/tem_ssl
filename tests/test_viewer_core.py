@@ -283,3 +283,27 @@ def test_distinguishing_decimals_rejects_a_round_to_zero():
     d = vc._distinguishing_decimals(values, start=4)
     assert d is not None
     assert not np.any(np.round(values, d) == 0)
+
+
+def test_histogram_singleton_does_not_round_a_positive_center_to_zero():
+    # Codex-reported case: the n <= 1 early return skipped the finite/nonzero
+    # checks entirely, so a one-bin histogram of a tiny positive score
+    # rounded straight to 0.0 with nothing to catch it.
+    h = vc.bragg_histogram([1e-10], bins=1)
+    assert len(h) == 1
+    assert (h["bragg_ratio"] > 0).all()
+
+
+def test_histogram_singleton_keeps_an_extreme_center_finite():
+    h = vc.bragg_histogram([1e300], bins=1)
+    assert len(h) == 1
+    assert np.isfinite(h["bragg_ratio"]).all()
+
+
+def test_distinguishing_decimals_singleton_widens_precision_when_needed():
+    assert vc._distinguishing_decimals(np.array([1e-10]), start=4) == 10
+    assert vc._distinguishing_decimals(np.array([5.0]), start=4) == 4
+
+
+def test_distinguishing_decimals_empty_array_is_harmless():
+    assert vc._distinguishing_decimals(np.array([]), start=4) == 4
