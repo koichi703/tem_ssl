@@ -304,11 +304,12 @@ def azimuthal_bragg_score(
     directly comparable across sources within a scale group.
 
     The band is clamped to 90% of the patch Nyquist frequency, so a coarse
-    group (meso/micro) whose pixels cannot resolve d_min_nm simply reports a
-    zero score rather than measuring noise.
+    group (meso/micro) whose pixels cannot resolve d_min_nm reports no score
+    at all (NaN in every field) rather than measuring noise or being mistaken
+    for a genuinely low, measured value.
     """
     nan = float("nan")
-    empty = {"bragg_ratio": 0.0, "bragg_d_nm": nan, "bragg_pixels": 0.0}
+    empty = {"bragg_ratio": nan, "bragg_d_nm": nan, "bragg_pixels": nan}
 
     n = int(arr01.shape[0])
     if arr01.ndim != 2 or arr01.shape[0] != arr01.shape[1] or n < 16:
@@ -1543,8 +1544,41 @@ def crystallinity_probe(
     if df.empty or not np.isfinite(df["bragg_ratio"]).any():
         return None
 
-    hi = float(df["bragg_ratio"].quantile(hi_quantile))
-    lo = float(df["bragg_ratio"].quantile(lo_quantile))
+    # Identify the checkpoint's held-out sources *before* touching
+    # bragg_ratio at all. The encoder was fitted on the `train` sources and
+    # selected on `val`, so scoring those sources would report how well the
+    # probe reads patches the representation has already seen -- and fitting
+    # the crystalline/amorphous quantile cut on those same held-out scores
+    # would be transductive rather than a genuine held-out evaluation: the
+    # test sources' own values would help decide the very threshold used to
+    # label them.
+    holdout: set[str] = set()
+    split_path = project / "models" / group / "split_manifest.csv"
+    if split_path.exists():
+        try:
+            split_df = pd.read_csv(split_path)
+            holdout = set(
+                split_df.loc[split_df["split"] == "test", "source_id"].unique()
+            )
+        except (ValueError, KeyError):
+            holdout = set()
+
+    # Thresholds are fit on non-held-out sources only, when there are any;
+    # an empty holdout (no checkpoint split, i.e. the LOSO fallback below)
+    # simply leaves the full pool, which is the only option when there is no
+    # held-out source to protect.
+    fit_mask = (
+        ~df["source_id"].isin(holdout) if holdout
+        else pd.Series(True, index=df.index)
+    )
+    threshold_pool = df.loc[fit_mask, "bragg_ratio"]
+    if threshold_pool.empty:
+        # A holdout covering every source in df leaves nothing to fit from;
+        # fall back to the full pool rather than fail outright.
+        threshold_pool = df["bragg_ratio"]
+
+    hi = float(threshold_pool.quantile(hi_quantile))
+    lo = float(threshold_pool.quantile(lo_quantile))
     if not np.isfinite(hi) or not np.isfinite(lo) or hi <= lo:
         print(f"[{group}] bragg_ratio has no usable spread; skipping probe.")
         return None
@@ -1559,22 +1593,8 @@ def crystallinity_probe(
             if df.loc[df["source_id"] == s, "label"].nunique() == 2
         ]
 
-    # The encoder was fitted on the `train` sources and selected on `val`, so
-    # scoring those sources would report how well the probe reads patches the
-    # representation has already seen. Only `test` sources are held out from
-    # the encoder, so those alone give an out-of-source estimate. The same
-    # split is applied to every block, keeping the numbers comparable.
-    holdout: set[str] = set()
-    split_path = project / "models" / group / "split_manifest.csv"
-    if split_path.exists():
-        try:
-            split_df = pd.read_csv(split_path)
-            holdout = set(
-                split_df.loc[split_df["split"] == "test", "source_id"].unique()
-            )
-        except (ValueError, KeyError):
-            holdout = set()
-
+    # The same split is applied to every representation block below, keeping
+    # the reported numbers comparable across them.
     present = set(df["source_id"].unique())
     eval_sources = both_classes(sorted(holdout & present))
     if eval_sources:
@@ -1819,7 +1839,17 @@ def analyze_group(
     selected_raw = hand[metadata_cols + selected].copy()
     selected_raw.to_csv(analysis_dir / "handcrafted_selected_raw.csv", index=False)
 
-    if not selected:
+    # fft_bragg_* can survive correlation pruning (it usually does: nothing
+    # else in the handcrafted set is a close proxy for it) and would then
+    # enter pca_handcrafted.csv. The viewer colours that PCA by Bragg-score
+    # band, so a feature computed from bragg_ratio itself would make any
+    # separation tautological rather than the honest SSL-vs-handcrafted
+    # comparison this PCA is meant to be. Excluded here, not upstream in
+    # `selected`, so handcrafted_selected_raw.csv above still records the
+    # full selection for reference.
+    pca_cols = [c for c in selected if not c.startswith("fft_bragg")]
+
+    if not pca_cols:
         # A previous run may have written PCA outputs that no longer match the
         # current feature files; drop them rather than let the viewer show
         # results that were never produced from this analysis.
@@ -1827,8 +1857,8 @@ def analyze_group(
             (analysis_dir / stale).unlink(missing_ok=True)
         print(
             f"[{group}] no handcrafted feature survived selection "
-            f"({len(hand_cols)} candidates were non-finite, constant, or "
-            "redundant); skipping handcrafted PCA."
+            f"({len(hand_cols)} candidates were non-finite, constant, "
+            "redundant, or Bragg-derived); skipping handcrafted PCA."
         )
         write_crystallinity_probe(
             project, group, analysis_dir, ssl, hand, metadata_cols,
@@ -1838,7 +1868,7 @@ def analyze_group(
 
     hand_pca, hand_var = pca_and_cluster(
         selected_raw,
-        selected,
+        pca_cols,
         metadata_cols,
         standardize=True,
     )

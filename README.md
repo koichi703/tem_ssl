@@ -84,8 +84,11 @@ by design.
    default), clamped to 90% of the *acquisition* Nyquist frequency rather
    than the resampled 224 px grid's -- so an upsampled patch can't have
    interpolation ringing mistaken for a reflection, and a scale group too
-   coarse to resolve that d-spacing (`meso`, `micro`) reports no score at
-   all.
+   coarse to resolve that d-spacing (`meso`, `micro`, or any individual
+   source whose pixel size makes the band unusable) reports **no score at
+   all**: `bragg_ratio`, `bragg_d_nm`, and `bragg_pixels` all come back as
+   `NaN`, never as a measured-looking `0.0`, so an unresolvable patch is
+   never mistaken for a genuinely low-crystallinity one downstream.
 3. For each radial ring in that band, compute `max power / median power`
    around the ring. A discrete Bragg reflection concentrates power at a few
    azimuths (high ratio); an amorphous halo is flat in angle (ratio near
@@ -109,12 +112,15 @@ amorphous halo read as an elliptical -- and falsely high-ratio -- reflection.
 discarded) become a frozen-feature classification target for logistic
 regression, written to `analysis/<group>/crystallinity_probe.csv`.
 
-- **Evaluated only on sources the encoder never trained on.** When
-  `models/<group>/split_manifest.csv` has a `test` split, only those
-  sources are scored, so the probe reports genuine out-of-source
-  generalization rather than how well the representation recognizes patches
-  it has already memorized. Without a usable split it falls back to
-  leave-one-source-out and records that in the `protocol` column.
+- **Evaluated only on sources the encoder never trained on -- and the
+  crystalline/amorphous quantile cut is fit without them too.** When
+  `models/<group>/split_manifest.csv` has a `test` split, both the `hi`/`lo`
+  thresholds and the evaluation are restricted to non-test sources and the
+  test sources respectively, so a held-out source's own scores never
+  influence the very cut used to label it. Without a usable split, both
+  fall back to using every source (leave-one-source-out for evaluation,
+  recorded as such in the `protocol` column) -- there is no held-out set to
+  protect in that case.
 - **Per-fold standardization.** Any column-wise scaler is fit on the
   training fold only -- fitting it on the whole set would leak the held-out
   source's own statistics into an L2-regularized classifier and inflate the
@@ -278,8 +284,12 @@ http://localhost:8501
 The sidebar picks the **observation scale** (`lattice`, `nano`, `meso`,
 `micro`, shown as e.g. "High-resolution / atomic scale (lattice)" rather
 than the raw key) and, when a crystallinity probe is available, a
-**Bragg-score band filter** (High / Ambiguous / Low) that applies across
-every tab below.
+**Bragg-score band filter** (High / Ambiguous / Low) that applies to the
+**Patches tab and both PCA scatters**. The Bragg-score tab's histogram and
+per-band counts intentionally show the whole current scale group regardless
+of this filter -- it is the reference distribution the bands were cut from,
+so filtering it would be circular. The Sources tab is unaffected too, since
+it reads `sources.csv` rather than per-patch scores.
 
 ### Patches
 
@@ -300,7 +310,9 @@ to change for a source-imbalance reason, not as a cue to change it
 automatically.
 
 **Click a bar** to see every patch whose score falls in that bin, as an
-image grid below the chart.
+image grid below the chart (capped at the first 32 patches, in manifest row
+order, if the bin holds more than that; the caption below the grid reports
+the true total).
 
 ### Sources
 
@@ -312,7 +324,8 @@ field of view, magnification, patch count.
 A PCA projection (PC1 vs. PC2) of the 512-D SSL embedding, and separately
 of the selected handcrafted descriptors, each coloured by Bragg-score band
 when thresholds are available. **Drag a rectangle** over the scatter to see
-every patch inside it as an image grid below.
+every patch inside it as an image grid below (same 32-patch cap as the
+Bragg-score histogram).
 
 Comparing the two PCA tabs side by side is informative on its own: if the
 handcrafted-feature PCA separates bands cleanly while the SSL PCA does not
