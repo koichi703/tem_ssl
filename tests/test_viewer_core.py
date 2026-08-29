@@ -392,6 +392,15 @@ def test_resolve_patch_paths_drops_unknown_ids_silently():
     assert [pid for pid, _ in out] == ["a"]
 
 
+def test_resolve_patch_paths_keeps_first_path_for_a_duplicate_id():
+    # Codex-reported case: dict(zip(...)) let the later "b2.png" row silently
+    # overwrite the earlier "b.png" one -- the opposite of the fixture's own
+    # "first wins" comment, and a mismatch against the Patches tab, which
+    # resolves a duplicate id via .iloc[0] on the filtered rows.
+    out = vc.resolve_patch_paths(["b"], _manifest_paths(), "/proj")
+    assert dict(out)["b"] == Path("/proj/x/b.png")
+
+
 def test_resolve_patch_paths_empty_inputs():
     assert vc.resolve_patch_paths([], _manifest_paths(), "/proj") == []
     assert vc.resolve_patch_paths(["a"], None, "/proj") == []
@@ -399,6 +408,37 @@ def test_resolve_patch_paths_empty_inputs():
 
 
 # ------------------------------------------------------- histogram bin edges
+def test_histogram_bin_bounds_include_the_value_that_landed_in_them():
+    # Codex-reported case: 10**log10(v) is not guaranteed to round-trip
+    # outward. For v=1.9438975097945483, the naive bin_lo came out as
+    # 1.9438975097945486 -- just above v -- so np.histogram counted v in this
+    # bin but patches_in_score_range(bin_lo, bin_hi) excluded it.
+    v = 1.9438975097945483
+    h = vc.bragg_histogram([v, 5.0, 50.0, 100.0], bins=10)
+    matched = h[(h["bin_lo"] <= v) & (v <= h["bin_hi"])]
+    assert len(matched) == 1
+
+    df = pd.DataFrame({"patch_id": ["a", "b", "c", "d"],
+                       "bragg_ratio": [v, 5.0, 50.0, 100.0]})
+    row = matched.iloc[0]
+    assert "a" in vc.patches_in_score_range(df, "bragg_ratio", row["bin_lo"], row["bin_hi"])
+
+
+def test_histogram_bin_bounds_recover_every_value_across_many_distributions():
+    # Broader sweep for the same class of round-trip error: no bin's own
+    # reported bounds may exclude a value np.histogram actually counted in it.
+    for seed in range(20):
+        rng = np.random.default_rng(seed)
+        n = int(rng.integers(5, 200))
+        bins = int(rng.integers(1, 40))
+        vals = rng.lognormal(mean=rng.uniform(-2, 3), sigma=rng.uniform(0.1, 4), size=n)
+        df = pd.DataFrame({"patch_id": [f"p{i}" for i in range(n)], "bragg_ratio": vals})
+        h = vc.bragg_histogram(vals, bins=bins)
+        for _, row in h.iterrows():
+            got = len(vc.patches_in_score_range(df, "bragg_ratio", row["bin_lo"], row["bin_hi"]))
+            assert got >= row["patches"], (seed, row["bin_id"])
+
+
 def test_histogram_bin_bounds_cover_the_reported_center():
     h = vc.bragg_histogram([1.0, 10.0, 100.0], bins=8)
     assert (h["bin_lo"] <= h["bin_hi"]).all()

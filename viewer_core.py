@@ -366,9 +366,17 @@ def resolve_patch_paths(
             or "patch_id" not in manifest.columns
             or "patch_path" not in manifest.columns):
         return []
-    path_by_id = dict(zip(
-        manifest["patch_id"].astype(str), manifest["patch_path"].astype(str)
-    ))
+    # dict(zip(...)) would let a later duplicate patch_id silently overwrite
+    # an earlier one; drop_duplicates(keep="first") matches the Patches tab,
+    # which resolves a duplicate id via `.iloc[0]` on the filtered rows, so a
+    # chart selection and the normal patch view agree on which image an id
+    # means.
+    first_seen = (
+        manifest[["patch_id", "patch_path"]]
+        .astype(str)
+        .drop_duplicates(subset="patch_id", keep="first")
+    )
+    path_by_id = dict(zip(first_seen["patch_id"], first_seen["patch_path"]))
     out = []
     root = Path(project_dir)
     for pid in patch_ids:
@@ -376,6 +384,9 @@ def resolve_patch_paths(
         if key in path_by_id:
             out.append((key, root / path_by_id[key]))
     return out
+
+
+_BOUND_ULPS = 8  # log10/power round-trip error observed up to 3 ULPs; 8 is a safety margin
 
 
 def bragg_histogram(
@@ -413,8 +424,21 @@ def bragg_histogram(
     centers = (edges[:-1] + edges[1:]) / 2.0
     if log:
         labels = np.power(10.0, centers)
+        # np.histogram binned in log space, so a value counted in this bin is
+        # only guaranteed to satisfy 10**edges[i] <= v <= 10**edges[i+1] up to
+        # log10/power round-trip error -- for v=1.9438975097945483 this
+        # round-trip lands at 1.9438975097945486, just above v itself. That
+        # excluded a value np.histogram had just counted from
+        # patches_in_score_range's linear-scale comparison. A single
+        # nextafter is not always enough: one observed case needed 3 ULPs to
+        # recover the original value, so bounds widen outward by _BOUND_ULPS
+        # steps -- a margin can only ever pull in a value right at a shared
+        # edge from a neighbouring bin, never drop one np.histogram counted.
         bin_lo = np.power(10.0, edges[:-1])
         bin_hi = np.power(10.0, edges[1:])
+        for _ in range(_BOUND_ULPS):
+            bin_lo = np.nextafter(bin_lo, -np.inf)
+            bin_hi = np.nextafter(bin_hi, np.inf)
     else:
         labels = centers
         bin_lo = edges[:-1]

@@ -324,7 +324,12 @@ with tab2:
                 " バーをクリックすると、そのビンに入るパッチを下に表示します。"
             )
 
-            bin_click = alt.selection_point(name="bragg_bin", fields=["bin_id"])
+            # toggle=False: a plain click always replaces the selection rather
+            # than accumulating on shift-click (Altair's default), so the
+            # handler below can safely read selected_bins[0] as *the* choice.
+            bin_click = alt.selection_point(
+                name="bragg_bin", fields=["bin_id"], toggle=False
+            )
             bar_chart = (
                 alt.Chart(hist)
                 .mark_bar()
