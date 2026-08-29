@@ -417,3 +417,20 @@ threshold fitting, and several viewer correctness fixes.
 
 Human review, direction, and final acceptance of every change came from the
 repository owner throughout.
+
+## License
+
+This project is licensed under the **GNU General Public License v3.0 or
+later (GPL-3.0-or-later)** -- see [`LICENSE`](LICENSE) for the full text.
+GPL-3.0-or-later was chosen in part because `hyperspy` and its DM4 reader
+`rosettasciio`, both required dependencies of this pipeline, are themselves
+licensed GPL-3.0-or-later.
+
+### 免責事項
+
+本ソフトウェアは科学研究用のパイロットツールであり、結果の正確性や利用に
+よって生じたいかなる損害についても保証しません。利用は利用者自身の責任
+において行ってください。この免責の詳細な条件は、GPLv3 本文の第15条
+（Disclaimer of Warranty）・第16条（Limitation of Liability）に定められて
+います（[`LICENSE`](LICENSE) 参照。なお法的効力を持つのは英語原文のみで
+あり、この日本語の記載は参考情報です）。
