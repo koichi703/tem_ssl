@@ -38,6 +38,98 @@ together, by design, so the representation is not told in advance which is
 which. Bragg-score bands (below) are a separate, viewer-side reading of a
 continuous score and are never used to filter what a model trains on.
 
+## How the self-supervised model learns
+
+Each eligible scale group is trained independently with a **SimCLR-style
+contrastive objective**. Two independently augmented views of the same patch
+are pulled together in embedding space, while every other patch in the same
+batch is pushed apart. No label is used anywhere in this step -- the model
+never sees "crystalline" or "amorphous," only "these two crops came from the
+same patch" (via augmentation) and "these are different patches" (via the
+rest of the batch).
+
+- **Encoder**: ResNet-18 with `conv1` changed to accept single-channel
+  (grayscale) input. Its 512-D pooled output -- not the 128-D projection-head
+  output -- is what `extract` saves as the SSL feature vector; the
+  projection head exists only to make the contrastive loss easier to
+  optimize and is discarded afterward, as in the original SimCLR paper.
+- **Loss**: NT-Xent (normalized temperature-scaled cross-entropy) over
+  cosine similarities between every pair in a batch, temperature 0.2 by
+  default (`--temperature`).
+- **Splits are by source DM4, not by patch.** Two patches from the same
+  micrograph are correlated -- same specimen region, same acquisition
+  conditions -- so a random patch-level split would leak information
+  between train and validation. `grouped_split` assigns whole source files
+  to train/val/test, and a group needs at least 3 independent sources
+  before it is trained at all (see "Critical interpretation rule" below).
+- **Augmentation is physically conservative** -- see "Why the augmentation
+  is conservative" below. The model is never shown a randomly resized or
+  cropped patch, because physical field of view was already standardized in
+  `prepare`, and arbitrary geometric distortion can alter spatial
+  frequencies that carry real scientific meaning in HRTEM.
+
+## Algorithm: Bragg-score crystallinity scoring
+
+`prepare` also computes a per-patch **Bragg score** directly from the
+patch's own power spectrum: a lightweight, unsupervised signal for how
+"crystalline" (discrete lattice reflections) versus "amorphous" (diffuse
+halo) it looks. It is used only by the viewer and the crystallinity probe
+below -- **never to filter, label, or split training data.** One SSL encoder
+per scale group still trains on crystalline and amorphous patches together,
+by design.
+
+1. Take the patch's 2D FFT power spectrum (Hann-windowed to suppress edge
+   artifacts).
+2. Restrict to a physically calibrated d-spacing band (0.12–1.0 nm by
+   default), clamped to 90% of the *acquisition* Nyquist frequency rather
+   than the resampled 224 px grid's -- so an upsampled patch can't have
+   interpolation ringing mistaken for a reflection, and a scale group too
+   coarse to resolve that d-spacing (`meso`, `micro`) reports no score at
+   all.
+3. For each radial ring in that band, compute `max power / median power`
+   around the ring. A discrete Bragg reflection concentrates power at a few
+   azimuths (high ratio); an amorphous halo is flat in angle (ratio near
+   1). The ratio is further divided by its expectation under pure noise --
+   `(ln(ring pixel count) + γ) / ln 2` -- so rings of different radius (and
+   therefore different pixel counts) stay directly comparable.
+4. `bragg_ratio` is the strongest ring's corrected ratio. `bragg_d_nm` is
+   the d-spacing of the reflection that produced *that* ratio, not simply
+   the brightest pixel in the band, which can belong to low-frequency
+   morphology instead of the actual reflection. `bragg_pixels` counts
+   pixels well above their own ring's local background.
+
+Frequencies are calibrated per axis from the source's true pixel size, so a
+source with non-square physical pixels doesn't have its genuinely circular
+amorphous halo read as an elliptical -- and falsely high-ratio -- reflection.
+
+## Algorithm: does the SSL representation encode crystallinity?
+
+`analyze` runs a **linear probe**: patches at the extreme quantiles of
+`bragg_ratio` (confidently high vs. confidently low; the ambiguous middle is
+discarded) become a frozen-feature classification target for logistic
+regression, written to `analysis/<group>/crystallinity_probe.csv`.
+
+- **Evaluated only on sources the encoder never trained on.** When
+  `models/<group>/split_manifest.csv` has a `test` split, only those
+  sources are scored, so the probe reports genuine out-of-source
+  generalization rather than how well the representation recognizes patches
+  it has already memorized. Without a usable split it falls back to
+  leave-one-source-out and records that in the `protocol` column.
+- **Per-fold standardization.** Any column-wise scaler is fit on the
+  training fold only -- fitting it on the whole set would leak the held-out
+  source's own statistics into an L2-regularized classifier and inflate the
+  reported AUC.
+- **Circular features are flagged, not silently ranked.** `fft_bragg_*`
+  reproduces the label almost by definition, and the rest of the `fft_*`
+  descriptors share its power spectrum; both are reported (`circular=True`)
+  for reference but excluded from the ranking, so a spectrum-derived
+  feature can never be reported as "best."
+
+This is the closest thing in the pipeline to a downstream evaluation task: a
+genuine test of whether the *unsupervised* 512-D embedding separates
+crystalline from amorphous structure, without ever having been told which
+patch is which.
+
 ## 1. Installation on Ubuntu
 
 ```bash
@@ -183,29 +275,65 @@ Then open the address shown by Streamlit, normally:
 http://localhost:8501
 ```
 
-The viewer can display:
+The sidebar picks the **observation scale** (`lattice`, `nano`, `meso`,
+`micro`, shown as e.g. "High-resolution / atomic scale (lattice)" rather
+than the raw key) and, when a crystallinity probe is available, a
+**Bragg-score band filter** (High / Ambiguous / Low) that applies across
+every tab below.
 
-- source metadata, labelled by observation scale (e.g. "High-resolution /
-  atomic scale (lattice)") rather than the raw `scale_group` key
-- each patch, with its Bragg score (`bragg_ratio`, `bragg_d_nm`,
-  `bragg_pixels`) when the manifest has one
-- a Bragg-score distribution histogram and a High / Ambiguous / Low band
-  filter that applies to both the Patches tab and the PCA scatters
-- cross-source nearest-neighbour patches
-- SSL PCA and handcrafted PCA, coloured by Bragg-score band when a
-  `crystallinity_probe.csv` with valid thresholds is available
+### Patches
 
-**The Bragg-score bands are not phase labels.** They are a per-dataset
-relative reading of a continuous FFT score (see `analyze`'s crystallinity
-probe, above): "High" means "high relative to this dataset's own score
+Pick a source, then a patch, to see its image, patch-level metadata, its
+Bragg score (`bragg_ratio`, `bragg_d_nm`, `bragg_pixels`) as labelled
+metrics, and its top-5 cross-source nearest neighbours -- patches from
+*other* source DM4 files that the SSL embedding considers most similar,
+useful for a quick visual check of whether the representation generalizes
+across independent images rather than recognizing one field of view.
+
+### Bragg score
+
+The distribution of `bragg_ratio` across the current scale group as a
+histogram (log-scaled x-axis; the score is heavily right-skewed), plus the
+patch/source count in each band and a per-source breakdown of band
+composition -- read this before deciding whether the training sampler needs
+to change for a source-imbalance reason, not as a cue to change it
+automatically.
+
+**Click a bar** to see every patch whose score falls in that bin, as an
+image grid below the chart.
+
+### Sources
+
+The `sources.csv` rows for the current scale group: physical pixel size,
+field of view, magnification, patch count.
+
+### SSL PCA / Handcrafted PCA
+
+A PCA projection (PC1 vs. PC2) of the 512-D SSL embedding, and separately
+of the selected handcrafted descriptors, each coloured by Bragg-score band
+when thresholds are available. **Drag a rectangle** over the scatter to see
+every patch inside it as an image grid below.
+
+Comparing the two PCA tabs side by side is informative on its own: if the
+handcrafted-feature PCA separates bands cleanly while the SSL PCA does not
+(or vice versa), that is a direct, visual answer to "does the learned
+representation capture what the hand-designed descriptors already capture,
+more, or less?"
+
+### On the Bragg-score bands
+
+**They are not phase labels.** They are a per-dataset relative reading of a
+continuous FFT score (see "Algorithm: Bragg-score crystallinity scoring"
+above): "High" means "high relative to this dataset's own score
 distribution," not "confirmed crystalline." Treat them as a viewer-side
 exploration aid, not as ground truth.
 
 The viewer degrades in two independent steps, each announced in the sidebar
 rather than silently dropped:
 
-- No `bragg_ratio` column (a dataset prepared before this scoring was added):
-  the Bragg-score tab has nothing to show at all -- no histogram, no bands.
+- No `bragg_ratio` column (a dataset prepared before this scoring was
+  added): the Bragg-score tab has nothing to show at all -- no histogram,
+  no bands.
 - `bragg_ratio` is present but `crystallinity_probe.csv` is missing, empty,
   unparseable, or its thresholds are non-finite or inverted: the histogram
   and per-patch scores still render, since those come from the manifest
