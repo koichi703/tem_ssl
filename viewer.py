@@ -2,11 +2,15 @@
 from pathlib import Path
 import sys
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from PIL import Image
 
 import viewer_core as vc
+
+MAX_PATCH_GRID = 32
+PATCH_GRID_COLS = 8
 
 st.set_page_config(
     page_title="TEM SSL Pilot Viewer",
@@ -143,6 +147,36 @@ def metric_value(row: pd.Series, key: str, fmt: str) -> str:
         return format(float(row[key]), fmt)
     except (TypeError, ValueError):
         return str(row[key])
+
+
+def render_patch_grid(
+    patch_ids: list[str],
+    manifest: pd.DataFrame,
+    project: Path,
+    max_show: int = MAX_PATCH_GRID,
+    cols: int = PATCH_GRID_COLS,
+) -> None:
+    """Thumbnail grid for a chart selection. Silent on an empty selection."""
+    pairs = vc.resolve_patch_paths(patch_ids, manifest, project)
+    if not pairs:
+        if patch_ids:
+            st.info("選択した範囲に対応する画像が見つかりませんでした。")
+        return
+
+    total = len(pairs)
+    shown = pairs[:max_show]
+    for start in range(0, len(shown), cols):
+        row = shown[start:start + cols]
+        columns = st.columns(len(row))
+        for column, (patch_id, path) in zip(columns, row):
+            with column:
+                if path.exists():
+                    st.image(Image.open(path), caption=patch_id, width="stretch")
+                else:
+                    st.caption(f"{patch_id}\n(画像なし)")
+
+    if total > max_show:
+        st.caption(f"{total} パッチ中、先頭 {max_show} 件のみ表示しています。")
 
 
 with tab1:
@@ -285,8 +319,57 @@ with tab2:
             st.info("ヒストグラムを描ける有限値がありません。")
         else:
             st.subheader("Bragg score の分布")
-            st.caption("横軸は対数スケール（スコアは大きく右に裾を引きます）。")
-            st.bar_chart(hist, x="bragg_ratio", y="patches", width="stretch")
+            st.caption(
+                "横軸は対数スケール（スコアは大きく右に裾を引きます）。"
+                " バーをクリックすると、そのビンに入るパッチを下に表示します。"
+            )
+
+            bin_click = alt.selection_point(name="bragg_bin", fields=["bin_id"])
+            bar_chart = (
+                alt.Chart(hist)
+                .mark_bar()
+                .encode(
+                    x=alt.X(
+                        "bragg_ratio:O",
+                        sort=list(hist["bragg_ratio"]),
+                        title="bragg_ratio",
+                        axis=alt.Axis(labelAngle=-90),
+                    ),
+                    y=alt.Y("patches:Q", title="patches"),
+                    opacity=alt.condition(bin_click, alt.value(1.0), alt.value(0.55)),
+                    tooltip=[
+                        alt.Tooltip("bragg_ratio:Q", title="bragg_ratio"),
+                        alt.Tooltip("patches:Q", title="patches"),
+                        alt.Tooltip("bin_lo:Q", title="bin low", format=".4g"),
+                        alt.Tooltip("bin_hi:Q", title="bin high", format=".4g"),
+                    ],
+                )
+                .add_params(bin_click)
+                .properties(height=280)
+            )
+            hist_event = st.altair_chart(
+                bar_chart,
+                on_select="rerun",
+                key=f"bragg_hist_{group}",
+                width="stretch",
+            )
+
+            selected_bins = (
+                hist_event.selection.get("bragg_bin")
+                if hist_event and hist_event.selection else None
+            )
+            if selected_bins:
+                bin_row = hist[hist["bin_id"] == selected_bins[0]["bin_id"]]
+                if not bin_row.empty:
+                    r = bin_row.iloc[0]
+                    bin_patch_ids = vc.patches_in_score_range(
+                        gdf, "bragg_ratio", r["bin_lo"], r["bin_hi"]
+                    )
+                    st.write(
+                        f"選択したビン: bragg_ratio **{r['bin_lo']:.4g}–{r['bin_hi']:.4g}**"
+                        f" ・ {len(bin_patch_ids)} パッチ"
+                    )
+                    render_patch_grid(bin_patch_ids, manifest, project)
 
         if bands_on:
             st.subheader("Band ごとの patch 数 / source 数")
@@ -322,7 +405,7 @@ with tab3:
         )
 
 
-def pca_tab(path: Path):
+def pca_tab(path: Path, chart_key: str):
     if not path.exists():
         st.info(
             "まだ解析結果がありません。"
@@ -346,31 +429,66 @@ def pca_tab(path: Path):
         height=500,
     )
 
-    if "PC1" in df.columns and "PC2" in df.columns:
-        keep = ["PC1", "PC2"] + ([color_col] if color_col else [])
-        plot_df = df[keep].copy()
+    if "PC1" not in df.columns or "PC2" not in df.columns:
+        return
 
-        plot_df["PC1"] = pd.to_numeric(
-            plot_df["PC1"],
-            errors="coerce",
+    has_id = "patch_id" in df.columns
+    keep = ["PC1", "PC2"] + (["patch_id"] if has_id else []) + ([color_col] if color_col else [])
+    plot_df = df[keep].copy()
+
+    plot_df["PC1"] = pd.to_numeric(plot_df["PC1"], errors="coerce")
+    plot_df["PC2"] = pd.to_numeric(plot_df["PC2"], errors="coerce")
+    plot_df = plot_df.dropna(subset=["PC1", "PC2"])
+
+    if color_col:
+        plot_df[color_col] = plot_df[color_col].fillna(vc.BAND_UNSCORED).astype(str)
+
+    if plot_df.empty:
+        return
+
+    if not has_id:
+        # No patch_id to resolve to an image (older analysis output):
+        # keep the plain, non-interactive chart rather than add a selector
+        # with nothing to select.
+        st.scatter_chart(plot_df, x="PC1", y="PC2", color=color_col, width="stretch")
+        return
+
+    st.caption("ドラッグで範囲を選択すると、含まれるパッチを下に表示します。")
+
+    brush = alt.selection_interval(name="pca_brush")
+    encoding = {
+        "x": alt.X("PC1:Q"),
+        "y": alt.Y("PC2:Q"),
+        "tooltip": ["patch_id"] + ([color_col] if color_col else []),
+    }
+    if color_col:
+        domain = [b for b in (*vc.BAND_ORDER, vc.BAND_UNSCORED) if b in set(plot_df[color_col])]
+        encoding["color"] = alt.Color(f"{color_col}:N", scale=alt.Scale(domain=domain))
+
+    chart = (
+        alt.Chart(plot_df)
+        .mark_circle(size=45)
+        .encode(**encoding)
+        .add_params(brush)
+        .properties(height=420)
+    )
+    scatter_event = st.altair_chart(
+        chart,
+        on_select="rerun",
+        key=f"pca_scatter_{chart_key}_{group}",
+        width="stretch",
+    )
+
+    sel = (
+        scatter_event.selection.get("pca_brush")
+        if scatter_event and scatter_event.selection else None
+    )
+    if sel and "PC1" in sel and "PC2" in sel:
+        selected_ids = vc.patches_in_rect(
+            plot_df, "PC1", "PC2", tuple(sel["PC1"]), tuple(sel["PC2"])
         )
-        plot_df["PC2"] = pd.to_numeric(
-            plot_df["PC2"],
-            errors="coerce",
-        )
-        plot_df = plot_df.dropna(subset=["PC1", "PC2"])
-
-        if color_col:
-            plot_df[color_col] = plot_df[color_col].fillna(vc.BAND_UNSCORED).astype(str)
-
-        if not plot_df.empty:
-            st.scatter_chart(
-                plot_df,
-                x="PC1",
-                y="PC2",
-                color=color_col,
-                width="stretch",
-            )
+        st.write(f"選択範囲: {len(selected_ids)} パッチ")
+        render_patch_grid(selected_ids, manifest, project)
 
 
 with tab4:
@@ -378,7 +496,8 @@ with tab4:
         project
         / "analysis"
         / group
-        / "pca_ssl.csv"
+        / "pca_ssl.csv",
+        chart_key="ssl",
     )
 
 
@@ -387,5 +506,6 @@ with tab5:
         project
         / "analysis"
         / group
-        / "pca_handcrafted.csv"
+        / "pca_handcrafted.csv",
+        chart_key="hand",
     )

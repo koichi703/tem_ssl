@@ -200,7 +200,7 @@ def test_band_by_source_degrades_quietly():
 # -------------------------------------------------------------- histogram
 def test_histogram_bins_finite_positive_values():
     h = vc.bragg_histogram([1.0, 10.0, 100.0], bins=8)
-    assert list(h.columns) == ["bragg_ratio", "patches"]
+    assert list(h.columns) == ["bragg_ratio", "patches", "bin_lo", "bin_hi", "bin_id"]
     assert h["patches"].sum() == 3
 
 
@@ -212,7 +212,7 @@ def test_histogram_drops_nan_inf_and_non_positive_on_log():
 def test_histogram_on_empty_or_all_invalid_returns_empty_frame():
     for bad in ([], [np.nan, np.nan], [0.0, -1.0], ["x", None]):
         h = vc.bragg_histogram(bad)
-        assert h.empty and list(h.columns) == ["bragg_ratio", "patches"]
+        assert h.empty and list(h.columns) == ["bragg_ratio", "patches", "bin_lo", "bin_hi", "bin_id"]
 
 
 def test_histogram_handles_constant_values():
@@ -307,3 +307,119 @@ def test_distinguishing_decimals_singleton_widens_precision_when_needed():
 
 def test_distinguishing_decimals_empty_array_is_harmless():
     assert vc._distinguishing_decimals(np.array([]), start=4) == 4
+
+
+# ------------------------------------------------------ selection -> patches
+def _scatter_df():
+    return pd.DataFrame({
+        "patch_id": ["a", "b", "c", "d"],
+        "PC1": [0.0, 1.0, 2.0, np.nan],
+        "PC2": [0.0, 1.0, 5.0, 1.0],
+    })
+
+
+def test_patches_in_rect_selects_the_covered_points():
+    ids = vc.patches_in_rect(_scatter_df(), "PC1", "PC2", (-0.5, 1.5), (-0.5, 1.5))
+    assert ids == ["a", "b"]
+
+
+def test_patches_in_rect_accepts_reversed_bounds():
+    ids = vc.patches_in_rect(_scatter_df(), "PC1", "PC2", (1.5, -0.5), (1.5, -0.5))
+    assert ids == ["a", "b"]
+
+
+def test_patches_in_rect_excludes_nan_coordinates():
+    ids = vc.patches_in_rect(_scatter_df(), "PC1", "PC2", (-10, 10), (-10, 10))
+    assert "d" not in ids and set(ids) == {"a", "b", "c"}
+
+
+@pytest.mark.parametrize("x_range,y_range", [
+    ((np.nan, 1.0), (0.0, 1.0)),
+    ((0.0, np.inf), (0.0, 1.0)),
+    (("x", "y"), (0.0, 1.0)),
+])
+def test_patches_in_rect_bad_range_returns_empty_not_raise(x_range, y_range):
+    assert vc.patches_in_rect(_scatter_df(), "PC1", "PC2", x_range, y_range) == []
+
+
+def test_patches_in_rect_missing_columns_or_frame():
+    assert vc.patches_in_rect(pd.DataFrame({"patch_id": ["a"]}), "PC1", "PC2", (0, 1), (0, 1)) == []
+    assert vc.patches_in_rect(None, "PC1", "PC2", (0, 1), (0, 1)) == []
+
+
+def _score_df():
+    return pd.DataFrame({
+        "patch_id": ["a", "b", "c", "d"],
+        "bragg_ratio": [1.0, 5.0, np.nan, 10.0],
+    })
+
+
+def test_patches_in_score_range_is_inclusive_on_both_ends():
+    ids = vc.patches_in_score_range(_score_df(), "bragg_ratio", 1.0, 5.0)
+    assert ids == ["a", "b"]
+
+
+def test_patches_in_score_range_excludes_nan():
+    assert "c" not in vc.patches_in_score_range(_score_df(), "bragg_ratio", 0.0, 100.0)
+
+
+@pytest.mark.parametrize("lo,hi", [(np.nan, 5.0), (1.0, np.nan), (5.0, 1.0)])
+def test_patches_in_score_range_bad_bounds_returns_empty(lo, hi):
+    assert vc.patches_in_score_range(_score_df(), "bragg_ratio", lo, hi) == []
+
+
+def test_patches_in_score_range_missing_columns_or_frame():
+    assert vc.patches_in_score_range(pd.DataFrame({"patch_id": ["a"]}), "bragg_ratio", 0, 1) == []
+    assert vc.patches_in_score_range(None, "bragg_ratio", 0, 1) == []
+
+
+# -------------------------------------------------------------- path lookup
+def _manifest_paths():
+    return pd.DataFrame({
+        "patch_id": ["a", "b", "b"],  # duplicate id, first wins
+        "patch_path": ["x/a.png", "x/b.png", "x/b2.png"],
+    })
+
+
+def test_resolve_patch_paths_joins_in_requested_order():
+    out = vc.resolve_patch_paths(["b", "a"], _manifest_paths(), "/proj")
+    assert [pid for pid, _ in out] == ["b", "a"]
+    assert dict(out)["a"] == Path("/proj/x/a.png")
+
+
+def test_resolve_patch_paths_drops_unknown_ids_silently():
+    out = vc.resolve_patch_paths(["a", "nope"], _manifest_paths(), "/proj")
+    assert [pid for pid, _ in out] == ["a"]
+
+
+def test_resolve_patch_paths_empty_inputs():
+    assert vc.resolve_patch_paths([], _manifest_paths(), "/proj") == []
+    assert vc.resolve_patch_paths(["a"], None, "/proj") == []
+    assert vc.resolve_patch_paths(["a"], pd.DataFrame({"patch_id": ["a"]}), "/proj") == []
+
+
+# ------------------------------------------------------- histogram bin edges
+def test_histogram_bin_bounds_cover_the_reported_center():
+    h = vc.bragg_histogram([1.0, 10.0, 100.0], bins=8)
+    assert (h["bin_lo"] <= h["bin_hi"]).all()
+    assert list(h["bin_id"]) == list(range(len(h)))
+
+
+def test_histogram_bin_bounds_are_not_truncated_by_display_rounding():
+    # bin_lo/bin_hi drive the click-filter; they must stay at full precision
+    # even when the displayed center needed the > 4 decimal fallback.
+    h = vc.bragg_histogram([1.0, 1.00001], bins=8, log=False)
+    assert not (h["bin_lo"] == h["bin_hi"]).any()
+
+
+# ------------------------------------------------------------ regression
+def test_bragg_histogram_bin_id_matches_patches_in_score_range():
+    """End-to-end shape check: a clicked bin's bounds actually recover its count."""
+    values = pd.Series([1.0, 2.0, 2.0, 50.0, 200.0])
+    ids = pd.Series(["a", "b", "c", "d", "e"])
+    df = pd.DataFrame({"patch_id": ids, "bragg_ratio": values})
+    hist = vc.bragg_histogram(values, bins=5)
+    for _, row in hist.iterrows():
+        selected = vc.patches_in_score_range(df, "bragg_ratio", row["bin_lo"], row["bin_hi"])
+        in_range = df[(df.bragg_ratio >= row["bin_lo"]) & (df.bragg_ratio <= row["bin_hi"])]
+        assert set(selected) == set(in_range.patch_id)

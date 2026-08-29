@@ -283,6 +283,101 @@ def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) 
     return None
 
 
+# ---------------------------------------------------------------------
+# Selection -> patch lookup
+# ---------------------------------------------------------------------
+# Pure translation from a chart selection (a rectangle on a PCA scatter, or a
+# clicked histogram bin) to the patch_ids it covers. Streamlit/Altair own the
+# widget and the event; these only ever see plain values, so they stay
+# testable without a running app.
+
+def patches_in_rect(
+    df: pd.DataFrame | None,
+    x_col: str,
+    y_col: str,
+    x_range: tuple[Any, Any],
+    y_range: tuple[Any, Any],
+    id_col: str = "patch_id",
+) -> list[str]:
+    """patch_ids whose (x_col, y_col) falls inside an axis-aligned rectangle."""
+    if (df is None or not isinstance(df, pd.DataFrame)
+            or x_col not in df.columns or y_col not in df.columns
+            or id_col not in df.columns):
+        return []
+    try:
+        x0, x1 = sorted(float(v) for v in x_range)
+        y0, y1 = sorted(float(v) for v in y_range)
+    except (TypeError, ValueError):
+        return []
+    if not all(math.isfinite(v) for v in (x0, x1, y0, y1)):
+        return []
+
+    xv = pd.to_numeric(df[x_col], errors="coerce")
+    yv = pd.to_numeric(df[y_col], errors="coerce")
+    mask = xv.between(x0, x1) & yv.between(y0, y1)
+    return df.loc[mask, id_col].astype(str).tolist()
+
+
+def patches_in_score_range(
+    df: pd.DataFrame | None,
+    score_col: str,
+    lo: Any,
+    hi: Any,
+    id_col: str = "patch_id",
+) -> list[str]:
+    """
+    patch_ids whose score falls in [lo, hi] (both ends inclusive).
+
+    Inclusive on both ends rather than the half-open ranges np.histogram
+    itself uses: this drives a "show me what's in this bin" display, where a
+    patch sitting exactly on a shared edge belonging to both its neighbours
+    is a harmless duplicate, not a bug worth the extra bookkeeping.
+    """
+    if (df is None or not isinstance(df, pd.DataFrame)
+            or score_col not in df.columns or id_col not in df.columns):
+        return []
+    try:
+        lo_f, hi_f = float(lo), float(hi)
+    except (TypeError, ValueError):
+        return []
+    if not (math.isfinite(lo_f) and math.isfinite(hi_f)) or hi_f < lo_f:
+        return []
+
+    v = pd.to_numeric(df[score_col], errors="coerce")
+    mask = v.between(lo_f, hi_f)
+    return df.loc[mask, id_col].astype(str).tolist()
+
+
+def resolve_patch_paths(
+    patch_ids: Iterable[Any],
+    manifest: pd.DataFrame | None,
+    project_dir: str | Path,
+) -> list[tuple[str, Path]]:
+    """
+    (patch_id, absolute image path) pairs for patch_ids present in manifest.
+
+    Order follows `patch_ids`; a patch_id absent from the manifest is
+    silently dropped rather than raising, since a stale selection outliving
+    a manifest reload should degrade to "shows fewer images," not crash.
+    Whether the path exists on disk is left to the caller (rendering), which
+    already needs to handle a missing file either way.
+    """
+    if (manifest is None or not isinstance(manifest, pd.DataFrame)
+            or "patch_id" not in manifest.columns
+            or "patch_path" not in manifest.columns):
+        return []
+    path_by_id = dict(zip(
+        manifest["patch_id"].astype(str), manifest["patch_path"].astype(str)
+    ))
+    out = []
+    root = Path(project_dir)
+    for pid in patch_ids:
+        key = str(pid)
+        if key in path_by_id:
+            out.append((key, root / path_by_id[key]))
+    return out
+
+
 def bragg_histogram(
     values: Iterable[Any],
     bins: int = 40,
@@ -296,7 +391,7 @@ def bragg_histogram(
     Returns an empty frame -- never raises -- when there is nothing to bin, and
     widens a zero-width range so constant data still produces one bar.
     """
-    cols = ["bragg_ratio", "patches"]
+    cols = ["bragg_ratio", "patches", "bin_lo", "bin_hi", "bin_id"]
     s = values if isinstance(values, pd.Series) else pd.Series(list(values))
     v = pd.to_numeric(s, errors="coerce").to_numpy(dtype="float64", na_value=np.nan)
     v = v[np.isfinite(v)]
@@ -316,15 +411,28 @@ def bragg_histogram(
 
     counts, edges = np.histogram(x, bins=n_bins, range=(lo, hi))
     centers = (edges[:-1] + edges[1:]) / 2.0
-    labels = np.power(10.0, centers) if log else centers
-    # st.bar_chart renders the x column as categorical text, so an unrounded
-    # float prints 15+ digits per tick and the axis becomes unreadable. A
-    # fixed 4 decimals collapsed distinct bins when the whole range is
-    # narrower than that (e.g. scores in [1.0, 1.00001]), so the precision is
-    # chosen per call: the fewest decimals -- starting from a readable 4 --
-    # that still keeps every bin center distinct.
+    if log:
+        labels = np.power(10.0, centers)
+        bin_lo = np.power(10.0, edges[:-1])
+        bin_hi = np.power(10.0, edges[1:])
+    else:
+        labels = centers
+        bin_lo = edges[:-1]
+        bin_hi = edges[1:]
+    # st.altair_chart renders the x column as categorical text for a bar
+    # chart, so an unrounded float prints 15+ digits per tick and the axis
+    # becomes unreadable. A fixed 4 decimals collapsed distinct bins when the
+    # whole range is narrower than that (e.g. scores in [1.0, 1.00001]), so
+    # the precision is chosen per call: the fewest decimals -- starting from
+    # a readable 4 -- that still keeps every bin center distinct.
     decimals = _distinguishing_decimals(labels, start=4)
     if decimals is not None:
         labels = np.round(labels, decimals)
     # else: leave the raw floats -- an unreadable tick beats a merged bin.
-    return pd.DataFrame({cols[0]: labels, cols[1]: counts})
+    # bin_lo/bin_hi stay unrounded regardless: they drive the click-to-filter
+    # range, where losing precision could exclude or include the wrong
+    # patches near a bin edge.
+    return pd.DataFrame({
+        cols[0]: labels, cols[1]: counts,
+        cols[2]: bin_lo, cols[3]: bin_hi, cols[4]: np.arange(n_bins),
+    })
