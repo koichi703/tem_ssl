@@ -114,13 +114,22 @@ regression, written to `analysis/<group>/crystallinity_probe.csv`.
 
 - **Evaluated only on sources the encoder never trained on -- and the
   crystalline/amorphous quantile cut is fit without them too.** When
-  `models/<group>/split_manifest.csv` has a `test` split, both the `hi`/`lo`
-  thresholds and the evaluation are restricted to non-test sources and the
-  test sources respectively, so a held-out source's own scores never
-  influence the very cut used to label it. Without a usable split, both
-  fall back to using every source (leave-one-source-out for evaluation,
-  recorded as such in the `protocol` column) -- there is no held-out set to
-  protect in that case.
+  `models/<group>/split_manifest.csv` has a `test` split, the `hi`/`lo`
+  thresholds are fit on the non-test sources only, so a held-out source's
+  own scores never influence the very cut used to label it. If those test
+  sources then carry both classes under that cut, they alone are evaluated
+  (`protocol` = `encoder-held-out`).
+
+  Two different situations fall back to leave-one-source-out instead, both
+  recorded as `all-sources-encoder-exposed`: no usable split exists at all,
+  so there is no held-out set to protect and every source both fits the
+  thresholds and is evaluated; or a split exists but its test source
+  doesn't carry both classes under the non-held-out thresholds. The second
+  case reuses those *same* thresholds rather than refitting from every
+  source -- so a held-out source's scores still never influence the cut --
+  and drops that source from the fallback entirely, neither fitting on it
+  nor evaluating it, so it is never counted as "encoder-exposed" under a
+  protocol name that claims exactly that.
 - **Per-fold standardization.** Any column-wise scaler is fit on the
   training fold only -- fitting it on the whole set would leak the held-out
   source's own statistics into an L2-regularized classifier and inflate the
@@ -284,8 +293,13 @@ http://localhost:8501
 The sidebar picks the **observation scale** (`lattice`, `nano`, `meso`,
 `micro`, shown as e.g. "High-resolution / atomic scale (lattice)" rather
 than the raw key) and, when a crystallinity probe is available, a
-**Bragg-score band filter** (High / Ambiguous / Low) that applies to the
-**Patches tab and both PCA scatters**. The Bragg-score tab's histogram and
+**Bragg-score band filter** (High / Ambiguous / Low, plus an "unscored"
+option) that applies to the **Patches tab and both PCA scatters**. The
+unscored option matters for a scale group that mixes scorable and
+acquisition-Nyquist-unscorable sources (see "Algorithm: Bragg-score
+crystallinity scoring" above): without it, those patches would silently
+disappear from the source picker and both PCA tabs even with High,
+Ambiguous, and Low all selected. The Bragg-score tab's histogram and
 per-band counts intentionally show the whole current scale group regardless
 of this filter -- it is the reference distribution the bands were cut from,
 so filtering it would be circular. The Sources tab is unaffected too, since
