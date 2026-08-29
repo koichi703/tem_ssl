@@ -434,11 +434,23 @@ def bragg_histogram(
         # recover the original value, so bounds widen outward by _BOUND_ULPS
         # steps -- a margin can only ever pull in a value right at a shared
         # edge from a neighbouring bin, never drop one np.histogram counted.
-        bin_lo = np.power(10.0, edges[:-1])
-        bin_hi = np.power(10.0, edges[1:])
+        # Overflow to inf is expected and handled below (clamped back to a
+        # finite bound), not a bug to surface as a warning on every call.
+        with np.errstate(over="ignore"):
+            bin_lo = np.power(10.0, edges[:-1])
+            bin_hi = np.power(10.0, edges[1:])
         for _ in range(_BOUND_ULPS):
             bin_lo = np.nextafter(bin_lo, -np.inf)
             bin_hi = np.nextafter(bin_hi, np.inf)
+        # A genuinely finite score near float64's range limit can push
+        # 10**edge past the representable range and overflow to +/-inf;
+        # nextafter cannot walk back from infinity (it only widens further
+        # outward), and patches_in_score_range rejects a non-finite bound
+        # outright -- which would make this bin's own nonempty bar
+        # unselectable. Clamp back to the largest finite magnitude.
+        finite_max = np.finfo(np.float64).max
+        bin_lo = np.clip(bin_lo, -finite_max, finite_max)
+        bin_hi = np.clip(bin_hi, -finite_max, finite_max)
     else:
         labels = centers
         bin_lo = edges[:-1]

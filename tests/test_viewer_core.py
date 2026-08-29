@@ -424,6 +424,30 @@ def test_histogram_bin_bounds_include_the_value_that_landed_in_them():
     assert "a" in vc.patches_in_score_range(df, "bragg_ratio", row["bin_lo"], row["bin_hi"])
 
 
+def test_histogram_clamps_overflowed_bin_bounds_to_finite():
+    # Codex-reported case: a finite score near float64's range limit pushes
+    # 10**edge past what a float can represent, overflowing bin_hi to +inf.
+    # patches_in_score_range rejects a non-finite bound outright, so the
+    # bar's own nonempty bin became unselectable.
+    big = np.finfo(np.float64).max
+    h = vc.bragg_histogram([1.0, big], bins=2)
+    assert np.isfinite(h["bin_lo"]).all()
+    assert np.isfinite(h["bin_hi"]).all()
+
+    df = pd.DataFrame({"patch_id": ["a", "b"], "bragg_ratio": [1.0, big]})
+    for _, row in h.iterrows():
+        selected = vc.patches_in_score_range(df, "bragg_ratio", row["bin_lo"], row["bin_hi"])
+        assert selected, f"bin {row['bin_id']} recovered no patches"
+
+
+def test_histogram_does_not_warn_on_overflowed_bin_bounds():
+    import warnings
+    big = np.finfo(np.float64).max
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        vc.bragg_histogram([1.0, big], bins=2)
+
+
 def test_histogram_bin_bounds_recover_every_value_across_many_distributions():
     # Broader sweep for the same class of round-trip error: no bin's own
     # reported bounds may exclude a value np.histogram actually counted in it.
