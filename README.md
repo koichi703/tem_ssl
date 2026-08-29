@@ -29,6 +29,15 @@ DM4 series:
 The important point is not the names themselves; it is that each SSL model sees
 patches representing comparable physical scales.
 
+**`scale_group` is an observation-scale bucket, not a crystallinity or material
+class.** `lattice` means "imaged at atomic-scale physical resolution," not
+"crystalline" -- an amorphous region imaged at 0.007 nm/pixel is still
+`lattice`. The pipeline does not split training or models by crystallinity;
+one SSL encoder per scale group sees both crystalline and amorphous patches
+together, by design, so the representation is not told in advance which is
+which. Bragg-score bands (below) are a separate, viewer-side reading of a
+continuous score and are never used to filter what a model trains on.
+
 ## 1. Installation on Ubuntu
 
 ```bash
@@ -176,11 +185,26 @@ http://localhost:8501
 
 The viewer can display:
 
-- source metadata
-- each patch
+- source metadata, labelled by observation scale (e.g. "High-resolution /
+  atomic scale (lattice)") rather than the raw `scale_group` key
+- each patch, with its Bragg score (`bragg_ratio`, `bragg_d_nm`,
+  `bragg_pixels`) when the manifest has one
+- a Bragg-score distribution histogram and a High / Ambiguous / Low band
+  filter that applies to both the Patches tab and the PCA scatters
 - cross-source nearest-neighbour patches
-- SSL PCA table/scatter
-- handcrafted PCA table/scatter
+- SSL PCA and handcrafted PCA, coloured by Bragg-score band when a
+  `crystallinity_probe.csv` with valid thresholds is available
+
+**The Bragg-score bands are not phase labels.** They are a per-dataset
+relative reading of a continuous FFT score (see `analyze`'s crystallinity
+probe, above): "High" means "high relative to this dataset's own score
+distribution," not "confirmed crystalline." Treat them as a viewer-side
+exploration aid, not as ground truth.
+
+Datasets prepared before this scoring was added have no `bragg_ratio` column;
+the viewer runs normally against them, just without the Bragg-score tab's
+histogram and bands. If `crystallinity_probe.csv` is missing, empty, or its
+thresholds are non-finite, the viewer falls back the same way and says so.
 
 ## Why the augmentation is conservative
 

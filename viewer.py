@@ -6,6 +6,8 @@ import pandas as pd
 import streamlit as st
 from PIL import Image
 
+import viewer_core as vc
+
 st.set_page_config(
     page_title="TEM SSL Pilot Viewer",
     page_icon="🔬",
@@ -40,11 +42,60 @@ if not groups:
     st.error("scale_group が manifest.csv に見つかりません。")
     st.stop()
 
-group = st.sidebar.selectbox("Scale group", groups)
+group = st.sidebar.selectbox(
+    "Observation scale",
+    groups,
+    format_func=vc.scale_group_label,
+)
+st.sidebar.caption(vc.SCALE_GROUP_NOTE)
+
 gdf = manifest[manifest["scale_group"].astype(str) == group].copy()
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Patches", "Sources", "SSL PCA", "Handcrafted PCA"]
+# --- Bragg score bands ------------------------------------------------
+# Bands exist only when `analyze` has written usable thresholds. Without them
+# the viewer still runs; it just shows the raw score, or nothing at all on an
+# older dataset that predates the Bragg descriptor.
+has_bragg = vc.has_bragg_scores(gdf)
+thresholds = vc.read_bragg_thresholds(
+    project / "analysis" / group / "crystallinity_probe.csv"
+)
+bands_on = bool(has_bragg and thresholds)
+
+if bands_on:
+    hi, lo = thresholds
+    gdf[vc.BAND_COLUMN] = vc.classify_bragg_band(gdf["bragg_ratio"], hi, lo)
+    selected_bands = st.sidebar.multiselect(
+        "Bragg score band",
+        list(vc.BAND_ORDER),
+        default=list(vc.BAND_ORDER),
+        help="Patches と PCA の両方に適用されます。",
+    )
+    st.sidebar.caption(vc.BRAGG_CAVEAT)
+else:
+    hi = lo = None
+    selected_bands = []
+    if not has_bragg:
+        st.sidebar.info(
+            "manifest.csv に bragg_ratio がありません。"
+            " prepare を実行し直すと Bragg score が記録されます。"
+        )
+    else:
+        st.sidebar.info(vc.probe_missing_note())
+
+
+def apply_band_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """Restrict a frame to the selected bands; a no-op when bands are off."""
+    if not bands_on or vc.BAND_COLUMN not in df.columns:
+        return df
+    if not selected_bands:
+        return df.iloc[0:0]
+    return df[df[vc.BAND_COLUMN].isin(selected_bands)]
+
+
+gdf_view = apply_band_filter(gdf)
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Patches", "Bragg score", "Sources", "SSL PCA", "Handcrafted PCA"]
 )
 
 
@@ -85,15 +136,33 @@ def dataframe_arrow_safe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def metric_value(row: pd.Series, key: str, fmt: str) -> str:
+    if key not in row.index or pd.isna(row[key]):
+        return "—"
+    try:
+        return format(float(row[key]), fmt)
+    except (TypeError, ValueError):
+        return str(row[key])
+
+
 with tab1:
-    source_ids = sorted(gdf["source_id"].dropna().astype(str).unique())
+    st.caption(f"Observation scale: **{vc.scale_group_label(group)}**")
+    if bands_on and len(gdf_view) != len(gdf):
+        st.caption(
+            f"Bragg score band で絞り込み中: {len(gdf_view)} / {len(gdf)} パッチ"
+        )
+
+    source_ids = sorted(gdf_view["source_id"].dropna().astype(str).unique())
 
     if not source_ids:
-        st.info("このscale groupにはsourceがありません。")
+        st.info(
+            "選択中の条件に該当する source がありません。"
+            if bands_on else "このscale groupにはsourceがありません。"
+        )
     else:
         source_id = st.selectbox("Source", source_ids)
 
-        sdf = gdf[gdf["source_id"].astype(str) == source_id].copy()
+        sdf = gdf_view[gdf_view["source_id"].astype(str) == source_id].copy()
         patch_ids = sdf["patch_id"].dropna().astype(str).tolist()
 
         if not patch_ids:
@@ -118,13 +187,28 @@ with tab1:
                     st.error(f"画像が見つかりません: {img_path}")
 
             with c2:
+                if has_bragg:
+                    st.subheader("Bragg score")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("bragg_ratio", metric_value(row, "bragg_ratio", ".2f"),
+                              help="半径リング上の方位角 max/median を、ノイズ下の期待値で"
+                                   " 割った値。等方ハローは 1 付近。")
+                    m2.metric("bragg_d_nm", metric_value(row, "bragg_d_nm", ".4f"),
+                              help="スコアが立ったリングの格子縞間隔 (nm)。")
+                    m3.metric("bragg_pixels", metric_value(row, "bragg_pixels", ".0f"),
+                              help="リング中央値の 5 倍を超えた画素数。")
+                    if bands_on:
+                        band = row.get(vc.BAND_COLUMN)
+                        st.write(f"Band: **{band if pd.notna(band) else vc.BAND_UNSCORED}**")
+                    st.caption(vc.BRAGG_CAVEAT)
+
                 st.subheader("Patch metadata")
 
                 metadata_table = series_to_arrow_safe_table(row)
                 st.dataframe(
                     metadata_table,
                     width="stretch",
-                    height=650,
+                    height=520,
                     hide_index=True,
                 )
 
@@ -180,6 +264,50 @@ with tab1:
 
 
 with tab2:
+    if not has_bragg:
+        st.info(
+            "manifest.csv に bragg_ratio がありません。"
+            " prepare を実行し直すと Bragg score が記録されます。"
+        )
+    else:
+        st.caption(vc.BRAGG_CAVEAT)
+
+        if bands_on:
+            st.write(
+                f"閾値: High ≥ **{hi:.4g}** / Low ≤ **{lo:.4g}** "
+                f"(analysis/{group}/crystallinity_probe.csv)"
+            )
+        else:
+            st.info(vc.probe_missing_note())
+
+        hist = vc.bragg_histogram(gdf["bragg_ratio"])
+        if hist.empty:
+            st.info("ヒストグラムを描ける有限値がありません。")
+        else:
+            st.subheader("Bragg score の分布")
+            st.caption("横軸は対数スケール（スコアは大きく右に裾を引きます）。")
+            st.bar_chart(hist, x="bragg_ratio", y="patches", width="stretch")
+
+        if bands_on:
+            st.subheader("Band ごとの patch 数 / source 数")
+            st.dataframe(
+                dataframe_arrow_safe(vc.band_summary(gdf)),
+                width="stretch", hide_index=True,
+            )
+
+            by_source = vc.band_by_source(gdf)
+            if not by_source.empty:
+                st.subheader("Source ごとの band 構成")
+                st.caption(
+                    "学習サンプラーを変更するかどうかは、まずこの偏りを見てから判断してください。"
+                )
+                st.dataframe(
+                    dataframe_arrow_safe(by_source),
+                    width="stretch", hide_index=True,
+                )
+
+
+with tab3:
     if sources.empty:
         st.info("sources.csv がありません。")
     else:
@@ -203,6 +331,14 @@ def pca_tab(path: Path):
         return
 
     df = pd.read_csv(path)
+    df = vc.attach_bragg_columns(df, manifest)
+
+    color_col = None
+    if bands_on and "bragg_ratio" in df.columns:
+        df[vc.BAND_COLUMN] = vc.classify_bragg_band(df["bragg_ratio"], hi, lo)
+        df = apply_band_filter(df)
+        color_col = vc.BAND_COLUMN
+        st.caption(vc.BRAGG_CAVEAT)
 
     st.dataframe(
         dataframe_arrow_safe(df),
@@ -211,7 +347,8 @@ def pca_tab(path: Path):
     )
 
     if "PC1" in df.columns and "PC2" in df.columns:
-        plot_df = df[["PC1", "PC2"]].copy()
+        keep = ["PC1", "PC2"] + ([color_col] if color_col else [])
+        plot_df = df[keep].copy()
 
         plot_df["PC1"] = pd.to_numeric(
             plot_df["PC1"],
@@ -221,18 +358,22 @@ def pca_tab(path: Path):
             plot_df["PC2"],
             errors="coerce",
         )
-        plot_df = plot_df.dropna()
+        plot_df = plot_df.dropna(subset=["PC1", "PC2"])
+
+        if color_col:
+            plot_df[color_col] = plot_df[color_col].fillna(vc.BAND_UNSCORED).astype(str)
 
         if not plot_df.empty:
             st.scatter_chart(
                 plot_df,
                 x="PC1",
                 y="PC2",
+                color=color_col,
                 width="stretch",
             )
 
 
-with tab3:
+with tab4:
     pca_tab(
         project
         / "analysis"
@@ -241,7 +382,7 @@ with tab3:
     )
 
 
-with tab4:
+with tab5:
     pca_tab(
         project
         / "analysis"
