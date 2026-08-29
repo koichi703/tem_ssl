@@ -201,10 +201,16 @@ probe, above): "High" means "high relative to this dataset's own score
 distribution," not "confirmed crystalline." Treat them as a viewer-side
 exploration aid, not as ground truth.
 
-Datasets prepared before this scoring was added have no `bragg_ratio` column;
-the viewer runs normally against them, just without the Bragg-score tab's
-histogram and bands. If `crystallinity_probe.csv` is missing, empty, or its
-thresholds are non-finite, the viewer falls back the same way and says so.
+The viewer degrades in two independent steps, each announced in the sidebar
+rather than silently dropped:
+
+- No `bragg_ratio` column (a dataset prepared before this scoring was added):
+  the Bragg-score tab has nothing to show at all -- no histogram, no bands.
+- `bragg_ratio` is present but `crystallinity_probe.csv` is missing, empty,
+  unparseable, or its thresholds are non-finite or inverted: the histogram
+  and per-patch scores still render, since those come from the manifest
+  alone; only the High/Ambiguous/Low bands, the band filter, and the PCA
+  colouring are unavailable, because those need `analyze`'s thresholds.
 
 ## Why the augmentation is conservative
 
