@@ -26,12 +26,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import random
 import re
-import sys
 import warnings
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -285,6 +282,159 @@ def load_source_images(
     ]
 
 
+DEFAULT_BRAGG_D_MIN_NM = 0.12
+DEFAULT_BRAGG_D_MAX_NM = 1.0
+
+
+def azimuthal_bragg_score(
+    arr01: np.ndarray,
+    patch_fov_nm: float,
+    d_min_nm: float = DEFAULT_BRAGG_D_MIN_NM,
+    d_max_nm: float = DEFAULT_BRAGG_D_MAX_NM,
+    patch_fov_nm_y: float | None = None,
+    source_pixels: int | None = None,
+) -> dict[str, float]:
+    """
+    Separate discrete Bragg reflections from the diffuse amorphous halo.
+
+    A crystalline patch concentrates power at a few azimuths on one radial
+    ring, so max/median around that ring is large. An amorphous halo is flat
+    in azimuth and its ratio stays near unity. Because patches are cropped by
+    physical field of view, the frequency axis is in nm^-1 and the score is
+    directly comparable across sources within a scale group.
+
+    The band is clamped to 90% of the patch Nyquist frequency, so a coarse
+    group (meso/micro) whose pixels cannot resolve d_min_nm simply reports a
+    zero score rather than measuring noise.
+    """
+    nan = float("nan")
+    empty = {"bragg_ratio": 0.0, "bragg_d_nm": nan, "bragg_pixels": 0.0}
+
+    n = int(arr01.shape[0])
+    if arr01.ndim != 2 or arr01.shape[0] != arr01.shape[1] or n < 16:
+        return empty
+    if not np.isfinite(patch_fov_nm) or patch_fov_nm <= 0:
+        return empty
+    if d_min_nm <= 0 or d_max_nm <= d_min_nm:
+        return empty
+
+    # A source with non-square physical pixels covers different physical
+    # widths along x and y even though the patch is square in pixels. Sharing
+    # one frequency axis would stretch a physically circular amorphous halo
+    # into an ellipse, and the azimuthal max/median ratio would read that
+    # ellipse as a Bragg reflection.
+    fov_x = float(patch_fov_nm)
+    fov_y = fov_x if patch_fov_nm_y is None else float(patch_fov_nm_y)
+    if not np.isfinite(fov_y) or fov_y <= 0:
+        fov_y = fov_x
+
+    x = np.asarray(arr01, dtype=np.float64)
+    x = x - x.mean()
+    window = np.outer(np.hanning(n), np.hanning(n))
+    power = np.abs(np.fft.fftshift(np.fft.fft2(x * window))) ** 2
+
+    freq_x = np.fft.fftshift(np.fft.fftfreq(n, d=fov_x / n))
+    freq_y = np.fft.fftshift(np.fft.fftfreq(n, d=fov_y / n))
+    fx, fy = np.meshgrid(freq_x, freq_y)
+    radius = np.sqrt(fx ** 2 + fy ** 2)
+
+    # Resampling to output_pixels cannot add information. When the source crop
+    # is smaller than the patch grid the image was upsampled, so scoring up to
+    # the patch Nyquist would let interpolation ringing be picked as a peak;
+    # the acquisition grid sets the real limit.
+    grid_px = n if source_pixels is None else min(n, int(source_pixels))
+    nyquist = grid_px / (2.0 * max(fov_x, fov_y))
+    f_lo = 1.0 / d_max_nm
+    f_hi = min(1.0 / d_min_nm, 0.9 * nyquist)
+    # A band clamped down to a hair above f_lo spans a single radial ring, so
+    # max/median there only measures noise. Require real width instead, which
+    # is how a coarse group whose pixels cannot resolve lattice fringes ends
+    # up reporting no score at all.
+    if f_hi < 1.5 * f_lo:
+        return empty
+
+    # Coarser of the two frequency steps, so each ring keeps enough samples
+    # for a robust azimuthal median; identical to 1/FOV when pixels are square.
+    bin_width = 1.0 / min(fov_x, fov_y)
+    rbin = np.rint(radius / bin_width).astype(int)
+    band = (radius >= f_lo) & (radius <= f_hi)
+    if not band.any():
+        return empty
+
+    ring_stats = []
+    for b in np.unique(rbin[band]):
+        ring = band & (rbin == b)
+        # Too few samples to estimate an azimuthal median robustly.
+        if ring.sum() < 12:
+            continue
+        vals = power[ring]
+        median = float(np.median(vals))
+        if not np.isfinite(median) or median <= 0:
+            continue
+        ring_stats.append((b, vals, median, int(ring.sum()), radius[ring]))
+
+    if len(ring_stats) < 2:
+        return empty
+
+    # A ring carrying a vanishing fraction of the patch's power holds only
+    # window sidelobes and float rounding, where max/median explodes to 1e9
+    # while meaning nothing -- a pure sinusoid would otherwise be reported at
+    # an empty high-frequency ring instead of its own.
+    #
+    # The test is on the ring's peak, not its median: a sharp reflection puts
+    # two bright pixels on a ring of fifty, so the very rings that matter most
+    # have a near-zero median and a median-based floor would discard exactly
+    # them. Real patches span ~1e3 between their strongest and weakest ring,
+    # so 1e6 below the band peak is far outside genuine signal.
+    band_peak = max(float(stat[1].max()) for stat in ring_stats)
+    floor = band_peak * 1e-6
+
+    best_ratio = 0.0
+    best_bin = None
+    peak_pixels = 0
+    scored = []
+    for b, vals, median, count, ring_radius in ring_stats:
+        if float(vals.max()) < floor:
+            continue
+        scored.append((b, vals, ring_radius))
+        peak_pixels += int((vals > 5.0 * median).sum())
+
+        # Power on a noise-only ring is roughly exponential, so max/median
+        # already grows like log(count) with the ring's circumference. Divide
+        # that expectation out so rings of different radius are comparable and
+        # an isotropic halo sits near 1 instead of near 10.
+        expected_max = (np.log(count) + np.euler_gamma) / np.log(2.0)
+        ratio = (float(vals.max()) / median) / float(expected_max)
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_bin = b
+
+    if len(scored) < 2 or best_bin is None:
+        return empty
+
+    # The spacing must describe the reflection the score actually fired on.
+    # Taking the brightest pixel of the whole band instead would report
+    # low-frequency morphology whenever that carries more absolute power than
+    # a weak lattice reflection. Neighbouring bins are included because
+    # leakage raises the true ring's own median, which can push the ratio one
+    # bin off the reflection.
+    peak_power = -np.inf
+    peak_radius = 0.0
+    for b, vals, ring_radius in scored:
+        if abs(int(b) - int(best_bin)) > 1:
+            continue
+        brightest = int(np.argmax(vals))
+        if float(vals[brightest]) > peak_power:
+            peak_power = float(vals[brightest])
+            peak_radius = float(ring_radius[brightest])
+
+    return {
+        "bragg_ratio": best_ratio,
+        "bragg_d_nm": 1.0 / peak_radius if peak_radius > 0 else nan,
+        "bragg_pixels": float(peak_pixels),
+    }
+
+
 def choose_scale_group(nm_per_pixel: float, config: dict[str, Any]) -> dict[str, Any]:
     for group in config["scale_groups"]:
         maxv = group.get("max_nm_per_pixel")
@@ -493,6 +643,15 @@ def command_prepare(args: argparse.Namespace) -> None:
                 patch_path = out_dir / f"{patch_id}.png"
                 pil.save(patch_path)
 
+                # Scored on the resampled patch, because the 224 px grid is
+                # what maps onto patch_fov_nm.
+                bragg = azimuthal_bragg_score(
+                    np.asarray(pil, dtype=np.float32) / 255.0,
+                    crop_px * sx,
+                    patch_fov_nm_y=crop_px * sy,
+                    source_pixels=crop_px,
+                )
+
                 rows.append({
                     "patch_id": patch_id,
                     "patch_path": str(patch_path.relative_to(project)),
@@ -502,6 +661,8 @@ def command_prepare(args: argparse.Namespace) -> None:
                     "scale_group": group_name,
                     "nm_per_pixel_source": nm_per_pixel,
                     "patch_fov_nm": patch_fov_nm,
+                    "patch_fov_nm_x": crop_px * sx,
+                    "patch_fov_nm_y": crop_px * sy,
                     "crop_size_px_source": crop_px,
                     "output_pixels": output_pixels,
                     "x_px_source": x,
@@ -510,6 +671,7 @@ def command_prepare(args: argparse.Namespace) -> None:
                     "y_nm_source": y * sy,
                     "patch_mean_normalized": float(np.mean(crop)),
                     "patch_std_normalized": float(np.std(crop)),
+                    **bragg,
                 })
 
             status_rows.append({
@@ -532,8 +694,8 @@ def command_prepare(args: argparse.Namespace) -> None:
     manifest.to_csv(dataset_dir / "manifest.csv", index=False)
     sources_df.to_csv(dataset_dir / "sources.csv", index=False)
     status_df.to_csv(dataset_dir / "prepare_status.csv", index=False)
-    shutil_config = project / "pilot_config_used.json"
-    shutil_config.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    config_used_path = project / "pilot_config_used.json"
+    config_used_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     print("\nPrepared pilot dataset.")
     print(f"Sources successfully prepared : {sources_df['source_id'].nunique()}")
@@ -703,6 +865,27 @@ def grouped_split(
     return out
 
 
+def balance_by_source(df: pd.DataFrame, seed: int) -> pd.DataFrame:
+    """
+    Subsample every source down to the smallest source's patch count.
+
+    Sources contribute wildly different patch counts (a low-magnification
+    image yields far fewer physical-FOV crops than a high-magnification one),
+    so without this a single source can dominate the contrastive batches.
+    """
+    counts = df.groupby("source_id").size()
+    if counts.empty or counts.nunique() == 1:
+        return df.reset_index(drop=True)
+
+    n_keep = int(counts.min())
+    rng = np.random.default_rng(seed)
+    parts = []
+    for _, part in df.groupby("source_id", sort=True):
+        idx = np.sort(rng.choice(len(part), size=n_keep, replace=False))
+        parts.append(part.iloc[idx])
+    return pd.concat(parts).reset_index(drop=True)
+
+
 def detect_device(requested: str):
     import torch
 
@@ -742,6 +925,16 @@ def train_one_group(
     train_df = split_df[split_df["split"] == "train"]
     val_df = split_df[split_df["split"] == "val"]
     test_df = split_df[split_df["split"] == "test"]
+
+    if getattr(args, "balance_sources", False):
+        before = len(train_df)
+        train_df = balance_by_source(train_df, seed)
+        print(
+            f"[{group}] source-balanced training set: "
+            f"{before} -> {len(train_df)} patches "
+            f"({train_df.source_id.nunique()} sources x "
+            f"{len(train_df) // max(1, train_df.source_id.nunique())})"
+        )
 
     print(
         f"\n[{group}] sources train/val/test = "
@@ -897,7 +1090,12 @@ def command_train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------
 # Handcrafted features
 # ---------------------------------------------------------------------
-def handcrafted_features(arr01: np.ndarray) -> dict[str, float]:
+def handcrafted_features(
+    arr01: np.ndarray,
+    patch_fov_nm: float | None = None,
+    patch_fov_nm_y: float | None = None,
+    source_pixels: int | None = None,
+) -> dict[str, float]:
     from scipy import stats
     from skimage import feature, filters
     from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
@@ -998,6 +1196,22 @@ def handcrafted_features(arr01: np.ndarray) -> dict[str, float]:
         ]:
             out[k] = 0.0
 
+    # fft_anisotropy above is a second-moment measure: it reports how elongated
+    # the whole power distribution is, so astigmatism and a genuine pair of
+    # Bragg reflections look alike. The azimuthal max/median ratio instead
+    # detects discrete peaks against the diffuse halo at the same radius.
+    if patch_fov_nm is not None and np.isfinite(patch_fov_nm):
+        bragg = azimuthal_bragg_score(
+            img,
+            float(patch_fov_nm),
+            patch_fov_nm_y=patch_fov_nm_y,
+            source_pixels=source_pixels,
+        )
+        out["fft_bragg_log_ratio"] = float(
+            np.log10(max(bragg["bragg_ratio"], 1.0))
+        )
+        out["fft_bragg_pixels"] = float(bragg["bragg_pixels"])
+
     return out
 
 
@@ -1063,7 +1277,17 @@ def extract_group_features(
     for i, row in group_df.iterrows():
         path = project / row["patch_path"]
         arr = np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0
-        f = handcrafted_features(arr)
+        # Prefer the calibrated per-axis field of view; older manifests only
+        # carry the nominal square value.
+        fov_x = row.get("patch_fov_nm_x")
+        if fov_x is None or not np.isfinite(fov_x):
+            fov_x = row.get("patch_fov_nm")
+        f = handcrafted_features(
+            arr,
+            fov_x,
+            patch_fov_nm_y=row.get("patch_fov_nm_y"),
+            source_pixels=row.get("crop_size_px_source"),
+        )
         handcrafted_rows.append({
             **{c: row[c] for c in base_cols},
             **f,
@@ -1126,7 +1350,9 @@ def prune_correlated_features(
         kept.append(c)
 
     X = X[kept]
-    corr = X.corr().abs()
+    # X.corr() on a frame with no columns returns an empty frame; guard anyway
+    # so the caller always receives a well-formed (possibly empty) matrix.
+    corr = X.corr().abs() if kept else pd.DataFrame()
 
     dropped = {}
     cols = list(X.columns)
@@ -1173,13 +1399,21 @@ def pca_and_cluster(
     from sklearn.preprocessing import StandardScaler, normalize
 
     X = df[feature_cols].to_numpy(float)
+    if X.shape[0] < 1 or X.shape[1] < 1:
+        raise ValueError(
+            f"PCA needs at least one sample and one feature; got {X.shape}."
+        )
 
     if standardize:
         X = StandardScaler().fit_transform(X)
     else:
         X = normalize(X, norm="l2")
 
-    n_components = max(2, min(20, X.shape[0] - 1, X.shape[1]))
+    # PCA requires n_components <= min(n_samples, n_features); the old
+    # max(2, ...) floor raised that ceiling and crashed on small or
+    # nearly-degenerate feature sets. Fewer than two components simply means
+    # no PC2 column downstream, which the viewer already tolerates.
+    n_components = min(20, X.shape[0], X.shape[1])
     pca = PCA(n_components=n_components, random_state=42)
     Z = pca.fit_transform(X)
 
@@ -1225,36 +1459,318 @@ def nearest_neighbours_cross_source(
     emb_df: pd.DataFrame,
     feature_cols: list[str],
     top_k: int = 5,
+    block_size: int = 512,
 ) -> pd.DataFrame:
     from sklearn.preprocessing import normalize
 
     X = normalize(emb_df[feature_cols].to_numpy(float), norm="l2")
-    sim = X @ X.T
+    patch_ids = emb_df["patch_id"].to_numpy()
+    source_ids = emb_df["source_id"].to_numpy()
+    n = len(X)
 
     rows = []
-    for i in range(len(emb_df)):
-        order = np.argsort(-sim[i])
-        rank = 0
-        for j in order:
-            if i == j:
+
+    # Similarities are computed in row blocks. Materializing the full N x N
+    # matrix costs 8*N^2 bytes -- already ~5 GB for 25k patches -- while only
+    # top_k cross-source neighbours per row are ever used.
+    for start in range(0, n, block_size):
+        stop = min(start + block_size, n)
+        sim_block = X[start:stop] @ X.T
+
+        for local_i, i in enumerate(range(start, stop)):
+            sims = sim_block[local_i]
+
+            # Same-source patches are excluded, which also removes j == i.
+            eligible = np.flatnonzero(source_ids != source_ids[i])
+            if eligible.size == 0:
                 continue
-            if emb_df.loc[i, "source_id"] == emb_df.loc[j, "source_id"]:
-                continue
-            rows.append({
-                "query_patch_id": emb_df.loc[i, "patch_id"],
-                "query_source_id": emb_df.loc[i, "source_id"],
-                "neighbor_rank": rank + 1,
-                "neighbor_patch_id": emb_df.loc[j, "patch_id"],
-                "neighbor_source_id": emb_df.loc[j, "source_id"],
-                "cosine_similarity": float(sim[i, j]),
-            })
-            rank += 1
-            if rank >= top_k:
-                break
+
+            k = min(top_k, eligible.size)
+            # argpartition finds the top k without sorting the whole row.
+            top = eligible[np.argpartition(-sims[eligible], k - 1)[:k]]
+            top = top[np.argsort(-sims[top])]
+
+            for rank, j in enumerate(top, start=1):
+                rows.append({
+                    "query_patch_id": patch_ids[i],
+                    "query_source_id": source_ids[i],
+                    "neighbor_rank": rank,
+                    "neighbor_patch_id": patch_ids[j],
+                    "neighbor_source_id": source_ids[j],
+                    "cosine_similarity": float(sims[j]),
+                })
+
     return pd.DataFrame(rows)
 
 
-def analyze_group(project: Path, group: str, corr_threshold: float) -> None:
+def crystallinity_probe(
+    project: Path,
+    group: str,
+    ssl_df: pd.DataFrame,
+    hand_df: pd.DataFrame,
+    metadata_cols: list[str],
+    hi_quantile: float,
+    lo_quantile: float,
+) -> pd.DataFrame | None:
+    """
+    Linear probe: can a representation tell crystalline from amorphous patches?
+
+    The label is the FFT Bragg score recorded during prepare, thresholded at
+    two quantiles so only confident patches are used; the ambiguous middle is
+    discarded. Folds are held out by source_id, because a patch-level split
+    would let the probe recognise the source image instead of the structure.
+
+    The score is derived from the power spectrum, so handcrafted FFT features
+    are partly circular with the label and their AUC is not comparable to the
+    others. The SSL columns are the honest comparison: PatchDataset
+    standardises every patch, so the encoder never sees absolute contrast.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+    from sklearn.preprocessing import StandardScaler, normalize
+
+    manifest_path = project / "dataset" / "manifest.csv"
+    manifest = pd.read_csv(manifest_path)
+    if "bragg_ratio" not in manifest.columns:
+        print(
+            f"[{group}] no bragg_ratio in {manifest_path.name}; "
+            "re-run prepare to enable the crystallinity probe."
+        )
+        return None
+
+    label_src = manifest[["patch_id", "bragg_ratio"]]
+    df = ssl_df.merge(label_src, on="patch_id", how="inner")
+    if df.empty or not np.isfinite(df["bragg_ratio"]).any():
+        return None
+
+    hi = float(df["bragg_ratio"].quantile(hi_quantile))
+    lo = float(df["bragg_ratio"].quantile(lo_quantile))
+    if not np.isfinite(hi) or not np.isfinite(lo) or hi <= lo:
+        print(f"[{group}] bragg_ratio has no usable spread; skipping probe.")
+        return None
+
+    keep = (df["bragg_ratio"] >= hi) | (df["bragg_ratio"] <= lo)
+    df = df[keep].copy()
+    df["label"] = (df["bragg_ratio"] >= hi).astype(int)
+
+    def both_classes(sources) -> list[str]:
+        return [
+            str(s) for s in sources
+            if df.loc[df["source_id"] == s, "label"].nunique() == 2
+        ]
+
+    # The encoder was fitted on the `train` sources and selected on `val`, so
+    # scoring those sources would report how well the probe reads patches the
+    # representation has already seen. Only `test` sources are held out from
+    # the encoder, so those alone give an out-of-source estimate. The same
+    # split is applied to every block, keeping the numbers comparable.
+    holdout: set[str] = set()
+    split_path = project / "models" / group / "split_manifest.csv"
+    if split_path.exists():
+        try:
+            split_df = pd.read_csv(split_path)
+            holdout = set(
+                split_df.loc[split_df["split"] == "test", "source_id"].unique()
+            )
+        except (ValueError, KeyError):
+            holdout = set()
+
+    present = set(df["source_id"].unique())
+    eval_sources = both_classes(sorted(holdout & present))
+    if eval_sources:
+        protocol = "encoder-held-out"
+        folds = [
+            (
+                np.flatnonzero(~df["source_id"].isin(eval_sources).to_numpy()),
+                np.flatnonzero((df["source_id"] == s).to_numpy()),
+            )
+            for s in eval_sources
+        ]
+    else:
+        usable = both_classes(sorted(present))
+        if len(usable) < 2:
+            print(
+                f"[{group}] fewer than 2 sources contain both classes; "
+                "skipping crystallinity probe."
+            )
+            return None
+        # No checkpoint split available (or its test source lacks both
+        # classes): fall back to plain leave-one-source-out and say so, since
+        # the encoder has seen most of these sources.
+        protocol = "all-sources-encoder-exposed"
+        eval_sources = usable
+        folds = [
+            (
+                np.flatnonzero((df["source_id"] != s).to_numpy()),
+                np.flatnonzero((df["source_id"] == s).to_numpy()),
+            )
+            for s in usable
+        ]
+
+    hand_cols = [c for c in hand_df.columns if c not in metadata_cols]
+    hand_aligned = df[["patch_id"]].merge(
+        hand_df[["patch_id"] + hand_cols], on="patch_id", how="left"
+    )
+    ssl_cols = [c for c in df.columns if c.startswith("ssl_")]
+
+    # The labels come from the patch's own power spectrum, so *every* fft_*
+    # descriptor shares their source, not just the fft_bragg_* pair that
+    # reproduces bragg_ratio outright. Any block containing them is circular
+    # to some degree, so they are reported for reference but kept out of the
+    # ranking; only spectrum-independent features form the honest baseline.
+    bragg_cols = [c for c in hand_cols if c.startswith("fft_bragg")]
+    # Everything spectrum-derived, used to keep the ranked baseline clean...
+    spectral_cols = [c for c in hand_cols if c.startswith("fft_")]
+    # ...while the generic FFT reference must exclude the Bragg columns, or it
+    # would carry the labelling score itself and stop measuring the remaining
+    # spectral descriptors.
+    fft_cols = [c for c in spectral_cols if c not in bragg_cols]
+    spatial_cols = [c for c in hand_cols if c not in spectral_cols]
+
+    # (matrix, needs_standardising, circular, caveat). L2 row normalisation is
+    # per sample and cannot leak; StandardScaler is per column and must
+    # therefore be fitted inside each fold, below.
+    blocks = {
+        "ssl_embedding": (
+            normalize(df[ssl_cols].to_numpy(float), norm="l2"),
+            False, False, "contrast-blind",
+        ),
+        "handcrafted_spatial": (
+            hand_aligned[spatial_cols].to_numpy(float),
+            True, False, "contrast-visible, spectrum-independent",
+        ),
+        "handcrafted_fft": (
+            hand_aligned[fft_cols].to_numpy(float),
+            True, True, "shares the label's power spectrum (not ranked)",
+        ),
+        "handcrafted_bragg": (
+            hand_aligned[bragg_cols].to_numpy(float),
+            True, True, "reproduces the label itself (not ranked)",
+        ),
+    }
+
+    y = df["label"].to_numpy()
+    rows = []
+    for name, (X, needs_scaling, circular, caveat) in blocks.items():
+        if X.shape[1] == 0:
+            continue
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        aucs = []
+        for tr, te in folds:
+            if len(np.unique(y[tr])) < 2 or len(np.unique(y[te])) < 2:
+                continue
+            x_tr, x_te = X[tr], X[te]
+            if needs_scaling:
+                # Fitting on the whole set would carry the held-out source's
+                # mean and variance into the fold, and LogisticRegression is
+                # L2-regularised by default, so that shifts the effective
+                # penalty and inflates the reported cross-source AUC.
+                scaler = StandardScaler().fit(x_tr)
+                x_tr = scaler.transform(x_tr)
+                x_te = scaler.transform(x_te)
+            clf = LogisticRegression(max_iter=3000).fit(x_tr, y[tr])
+            aucs.append(
+                roc_auc_score(y[te], clf.predict_proba(x_te)[:, 1])
+            )
+        if not aucs:
+            continue
+        rows.append({
+            "representation": name,
+            "dimensions": int(X.shape[1]),
+            "circular": circular,
+            "caveat": caveat,
+            "folds": len(aucs),
+            "auc_mean": float(np.mean(aucs)),
+            # A single held-out source gives no spread to report; 0.0 would
+            # read as a tight, well-replicated estimate.
+            "auc_std": float(np.std(aucs)) if len(aucs) > 1 else float("nan"),
+            "auc_min": float(np.min(aucs)),
+        })
+
+    if not rows:
+        return None
+
+    # Circular rows sort last so they can never be read as the best result.
+    out = pd.DataFrame(rows).sort_values(
+        ["circular", "auc_mean"], ascending=[True, False]
+    )
+    # Counts must describe the rows actually scored: under encoder-held-out
+    # only the test sources are evaluated, so whole-dataset totals would
+    # overstate the evaluation sample by several times.
+    is_eval = df["source_id"].isin(eval_sources).to_numpy()
+    out["protocol"] = protocol
+    out["eval_sources"] = ";".join(eval_sources)
+    out["n_eval_crystalline"] = int(y[is_eval].sum())
+    out["n_eval_amorphous"] = int((1 - y[is_eval]).sum())
+    # Under leave-one-source-out the fit set differs per fold, so a single
+    # figure would be wrong; only the fixed encoder-held-out split has one.
+    out["n_fit_patches"] = (
+        float((~is_eval).sum())
+        if protocol == "encoder-held-out"
+        else float("nan")
+    )
+    out["n_total_crystalline"] = int(y.sum())
+    out["n_total_amorphous"] = int((1 - y).sum())
+    out["threshold_hi"] = hi
+    out["threshold_lo"] = lo
+    return out
+
+
+def write_crystallinity_probe(
+    project: Path,
+    group: str,
+    analysis_dir: Path,
+    ssl_df: pd.DataFrame,
+    hand_df: pd.DataFrame,
+    metadata_cols: list[str],
+    hi_quantile: float,
+    lo_quantile: float,
+) -> None:
+    """
+    Run the probe and publish its result, or leave no result behind.
+
+    The CSV is removed first: when the probe cannot run this time -- an old
+    manifest, constant scores, too few sources carrying both classes, or
+    shifted thresholds -- a file from an earlier run would otherwise be read
+    as the current analysis.
+    """
+    out_path = analysis_dir / "crystallinity_probe.csv"
+    out_path.unlink(missing_ok=True)
+
+    probe = crystallinity_probe(
+        project, group, ssl_df, hand_df, metadata_cols,
+        hi_quantile, lo_quantile,
+    )
+    if probe is None:
+        return
+
+    probe.to_csv(out_path, index=False)
+    ranked = probe[~probe["circular"]]
+    if ranked.empty:
+        return
+    best = ranked.iloc[0]
+    ssl_row = probe[probe["representation"] == "ssl_embedding"]
+    ssl_txt = (
+        f", SSL AUC={ssl_row.auc_mean.iloc[0]:.3f}" if not ssl_row.empty else ""
+    )
+    print(
+        f"[{group}] crystallinity probe [{best.protocol}]: evaluated on "
+        f"{int(best.n_eval_crystalline)} crystalline / "
+        f"{int(best.n_eval_amorphous)} amorphous held-out patches over "
+        f"{int(best.folds)} fold(s) "
+        f"(of {int(best.n_total_crystalline)}/{int(best.n_total_amorphous)} "
+        f"labelled in total); best={best.representation} "
+        f"AUC={best.auc_mean:.3f}{ssl_txt}"
+    )
+
+
+def analyze_group(
+    project: Path,
+    group: str,
+    corr_threshold: float,
+    probe_hi_quantile: float = 0.85,
+    probe_lo_quantile: float = 0.35,
+) -> None:
     feat_dir = project / "features"
     analysis_dir = project / "analysis" / group
     analysis_dir.mkdir(parents=True, exist_ok=True)
@@ -1303,6 +1819,23 @@ def analyze_group(project: Path, group: str, corr_threshold: float) -> None:
     selected_raw = hand[metadata_cols + selected].copy()
     selected_raw.to_csv(analysis_dir / "handcrafted_selected_raw.csv", index=False)
 
+    if not selected:
+        # A previous run may have written PCA outputs that no longer match the
+        # current feature files; drop them rather than let the viewer show
+        # results that were never produced from this analysis.
+        for stale in ("pca_handcrafted.csv", "pca_handcrafted_variance.csv"):
+            (analysis_dir / stale).unlink(missing_ok=True)
+        print(
+            f"[{group}] no handcrafted feature survived selection "
+            f"({len(hand_cols)} candidates were non-finite, constant, or "
+            "redundant); skipping handcrafted PCA."
+        )
+        write_crystallinity_probe(
+            project, group, analysis_dir, ssl, hand, metadata_cols,
+            probe_hi_quantile, probe_lo_quantile,
+        )
+        return
+
     hand_pca, hand_var = pca_and_cluster(
         selected_raw,
         selected,
@@ -1315,6 +1848,11 @@ def analyze_group(project: Path, group: str, corr_threshold: float) -> None:
         "explained_variance_ratio": hand_var,
         "cumulative_variance": np.cumsum(hand_var),
     }).to_csv(analysis_dir / "pca_handcrafted_variance.csv", index=False)
+
+    write_crystallinity_probe(
+        project, group, analysis_dir, ssl, hand, metadata_cols,
+        probe_hi_quantile, probe_lo_quantile,
+    )
 
     print(
         f"[{group}] analysis complete: "
@@ -1337,7 +1875,10 @@ def command_analyze(args: argparse.Namespace) -> None:
         )
 
     for group in requested:
-        analyze_group(project, group, args.corr_threshold)
+        analyze_group(
+            project, group, args.corr_threshold,
+            args.probe_hi_quantile, args.probe_lo_quantile,
+        )
 
 
 # ---------------------------------------------------------------------
@@ -1377,6 +1918,12 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--temperature", type=float, default=0.2)
     train.add_argument("--projection-dim", type=int, default=128)
     train.add_argument(
+        "--balance-sources",
+        action="store_true",
+        help="Subsample each training source to the smallest source's patch "
+             "count so one image cannot dominate the contrastive batches.",
+    )
+    train.add_argument(
         "--device",
         default="auto",
         help="auto, cuda, cpu, mps, cuda:0, ...",
@@ -1397,6 +1944,20 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--groups", nargs="*", default=[])
     analyze.add_argument("--all-extracted", action="store_true")
     analyze.add_argument("--corr-threshold", type=float, default=0.95)
+    analyze.add_argument(
+        "--probe-hi-quantile",
+        type=float,
+        default=0.85,
+        help="Patches at or above this bragg_ratio quantile are labelled "
+             "crystalline for the linear probe.",
+    )
+    analyze.add_argument(
+        "--probe-lo-quantile",
+        type=float,
+        default=0.35,
+        help="Patches at or below this bragg_ratio quantile are labelled "
+             "amorphous; the ambiguous middle is discarded.",
+    )
     analyze.set_defaults(func=command_analyze)
 
     return p
