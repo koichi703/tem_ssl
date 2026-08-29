@@ -1,0 +1,37 @@
+{
+  "output_pixels": 224,
+  "overlap": 0.5,
+  "max_patches_per_source": 250,
+  "min_crop_pixels": 64,
+  "clip_percentiles": [
+    0.5,
+    99.5
+  ],
+  "seed": 42,
+  "scale_groups": [
+    {
+      "name": "lattice",
+      "max_nm_per_pixel": 0.0125,
+      "patch_fov_nm": 4.0,
+      "description": "HRTEM / lattice-scale images"
+    },
+    {
+      "name": "nano",
+      "max_nm_per_pixel": 0.05,
+      "patch_fov_nm": 15.0,
+      "description": "nanoscale particle / local morphology"
+    },
+    {
+      "name": "meso",
+      "max_nm_per_pixel": 0.5,
+      "patch_fov_nm": 100.0,
+      "description": "aggregate-scale morphology"
+    },
+    {
+      "name": "micro",
+      "max_nm_per_pixel": null,
+      "patch_fov_nm": 1000.0,
+      "description": "low-magnification micrometre-scale morphology"
+    }
+  ]
+}
