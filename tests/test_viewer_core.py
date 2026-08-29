@@ -223,3 +223,22 @@ def test_histogram_handles_constant_values():
 def test_histogram_linear_mode_keeps_non_positive_values():
     h = vc.bragg_histogram([-1.0, 0.0, 1.0], bins=4, log=False)
     assert h["patches"].sum() == 3
+
+
+def test_histogram_preserves_distinct_centers_on_a_narrow_range():
+    # Codex-reported case: a range under ~1e-4 collapsed every bin center to
+    # the same value (or to 0) under a fixed 4-decimal rounding.
+    h = vc.bragg_histogram([1.0, 1.00001], bins=8, log=False)
+    assert h["bragg_ratio"].nunique() == len(h)
+    assert (h["bragg_ratio"] != 0).all() or h["patches"].sum() == 2
+
+
+def test_histogram_still_rounds_to_four_decimals_on_an_ordinary_range():
+    h = vc.bragg_histogram([1.0, 500.0], bins=10)
+    # readability is unaffected when nothing needs extra precision
+    assert all(round(v, 4) == v for v in h["bragg_ratio"])
+
+
+def test_histogram_widens_precision_only_as_far_as_needed():
+    h = vc.bragg_histogram([100.0, 100.0 + 1e-8], bins=4, log=False)
+    assert h["bragg_ratio"].nunique() == len(h)

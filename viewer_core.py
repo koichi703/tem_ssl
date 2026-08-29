@@ -240,6 +240,23 @@ def band_by_source(
     return out.reset_index()
 
 
+def _distinguishing_decimals(values: np.ndarray, start: int = 4, cap: int = 15) -> int:
+    """
+    Fewest decimal places (at least `start`, for readability) that keep every
+    value in `values` distinct after rounding. Histogram bin centers are
+    already sorted and unique before rounding, so this only widens the
+    precision when a fixed decimal count would otherwise merge adjacent bins;
+    `cap` bounds the search at float64's usable precision.
+    """
+    n = len(values)
+    if n <= 1:
+        return start
+    for d in range(start, cap + 1):
+        if len(np.unique(np.round(values, d))) == n:
+            return d
+    return cap
+
+
 def bragg_histogram(
     values: Iterable[Any],
     bins: int = 40,
@@ -275,6 +292,10 @@ def bragg_histogram(
     centers = (edges[:-1] + edges[1:]) / 2.0
     labels = np.power(10.0, centers) if log else centers
     # st.bar_chart renders the x column as categorical text, so an unrounded
-    # float prints 15+ digits per tick and the axis becomes unreadable.
-    labels = np.round(labels, 4)
+    # float prints 15+ digits per tick and the axis becomes unreadable. A
+    # fixed 4 decimals collapsed distinct bins when the whole range is
+    # narrower than that (e.g. scores in [1.0, 1.00001]), so the precision is
+    # chosen per call: the fewest decimals -- starting from a readable 4 --
+    # that still keeps every bin center distinct.
+    labels = np.round(labels, _distinguishing_decimals(labels, start=4))
     return pd.DataFrame({cols[0]: labels, cols[1]: counts})
