@@ -18,8 +18,9 @@ The pipeline does **not** mix all magnifications blindly.
 9. Perform correlation-based feature selection for handcrafted descriptors.
 10. Run PCA / exploratory KMeans and cross-source nearest-neighbour checks.
 
-The default configuration was chosen as a pilot for the uploaded
-DM4 series:
+The default configuration below was chosen as a pilot for one DM4 series;
+adjust `pilot_config.json`'s scale-group thresholds for your own material
+and magnification range:
 
 - `lattice`: ≤ 0.0125 nm/pixel, 4 nm field-of-view patches
 - `nano`: ≤ 0.05 nm/pixel, 15 nm patches
