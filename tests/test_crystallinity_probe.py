@@ -198,6 +198,24 @@ def test_encoder_held_out_evaluates_only_qualifying_test_sources(tmp_path):
     assert int(row["folds"]) == 1
 
 
+def test_loso_fallback_skips_probe_with_only_one_qualifying_source(tmp_path):
+    # Codex-reported doc gap: unlike encoder-held-out (which fires with as
+    # few as one qualifying source), the LOSO fallback needs len(usable)>=2
+    # to produce anything -- a source-level train/test split needs both
+    # sides. A single qualifying source must skip the whole probe (None),
+    # not evaluate that one source alone.
+    rng = np.random.default_rng(7)
+    rows = []
+    for i, v in enumerate(np.concatenate([rng.uniform(0, 5, 10), rng.uniform(195, 200, 10)])):
+        rows.append(_manifest_row("s_only", f"p{i}", float(v)))
+    manifest = pd.DataFrame(rows)
+    ssl_df, hand_df = _feature_frames(manifest, seed=7)
+
+    project = _project(tmp_path, manifest, split_rows=None)
+    probe = T.crystallinity_probe(project, "g", ssl_df, hand_df, METADATA_COLS, 0.85, 0.35)
+    assert probe is None
+
+
 def test_thresholds_use_full_pool_without_any_split(tmp_path):
     # No split_manifest.csv at all: this is the plain LOSO path, where using
     # the full pool was always correct and must remain so.

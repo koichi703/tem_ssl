@@ -129,7 +129,12 @@ regression, written to `analysis/<group>/crystallinity_probe.csv`.
   the same per-source rule to every remaining source: each is evaluated as
   a fold only if it individually carries both classes, while a
   single-class source still contributes to the quantile thresholds and to
-  other sources' fit data without ever being evaluated itself. A genuinely
+  other sources' fit data without ever being evaluated itself. Unlike
+  `encoder-held-out`, this fallback also needs **at least two** qualifying
+  sources to produce anything: a single qualifying source is not enough,
+  and the whole probe is skipped (no CSV, no fold) rather than evaluating
+  that one source alone -- a source-level train/test split needs something
+  on both sides. A genuinely
   held-out (`test`-split) source is the one exception -- it is dropped from
   this fallback entirely (neither fit on nor evaluated), reusing the same
   non-held-out thresholds rather than refitting from every source, so it is
