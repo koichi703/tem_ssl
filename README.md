@@ -116,20 +116,25 @@ regression, written to `analysis/<group>/crystallinity_probe.csv`.
   crystalline/amorphous quantile cut is fit without them too.** When
   `models/<group>/split_manifest.csv` has a `test` split, the `hi`/`lo`
   thresholds are fit on the non-test sources only, so a held-out source's
-  own scores never influence the very cut used to label it. If those test
-  sources then carry both classes under that cut, they alone are evaluated
-  (`protocol` = `encoder-held-out`).
+  own scores never influence the very cut used to label it. Eligibility for
+  evaluation is per-source, not all-or-nothing: each `test` source is
+  evaluated as its own fold only if it individually carries both classes
+  under that cut; one that comes out single-class simply contributes no
+  fold. `protocol` = `encoder-held-out` as soon as at least one test source
+  qualifies -- it does not require all of them to.
 
-  Two different situations fall back to leave-one-source-out instead, both
-  recorded as `all-sources-encoder-exposed`: no usable split exists at all,
-  so there is no held-out set to protect and every source both fits the
-  thresholds and is evaluated; or a split exists but its test source
-  doesn't carry both classes under the non-held-out thresholds. The second
-  case reuses those *same* thresholds rather than refitting from every
-  source -- so a held-out source's scores still never influence the cut --
-  and drops that source from the fallback entirely, neither fitting on it
-  nor evaluating it, so it is never counted as "encoder-exposed" under a
-  protocol name that claims exactly that.
+  The fallback to leave-one-source-out -- recorded as
+  `all-sources-encoder-exposed` -- triggers only when *no* test source
+  qualifies, including when there is no split at all. That sweep applies
+  the same per-source rule to every remaining source: each is evaluated as
+  a fold only if it individually carries both classes, while a
+  single-class source still contributes to the quantile thresholds and to
+  other sources' fit data without ever being evaluated itself. A genuinely
+  held-out (`test`-split) source is the one exception -- it is dropped from
+  this fallback entirely (neither fit on nor evaluated), reusing the same
+  non-held-out thresholds rather than refitting from every source, so it is
+  never counted as "encoder-exposed" under a protocol name that claims
+  exactly that.
 - **Per-fold standardization.** Any column-wise scaler is fit on the
   training fold only -- fitting it on the whole set would leak the held-out
   source's own statistics into an L2-regularized classifier and inflate the

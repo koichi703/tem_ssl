@@ -166,6 +166,38 @@ def test_held_out_source_never_enters_loso_fallback_evaluation(tmp_path):
     assert "s_test" not in eval_sources
 
 
+def test_encoder_held_out_evaluates_only_qualifying_test_sources(tmp_path):
+    # Codex-reported doc gap: "encoder-held-out" does not require every test
+    # source to carry both classes -- it fires as soon as ANY test source
+    # does, and evaluates only that qualifying subset. A single-class test
+    # source contributes no fold of its own (it ends up on the *fit* side of
+    # the qualifying source's fold instead).
+    rng = np.random.default_rng(5)
+    rows = []
+    for src in ("s1", "s2"):
+        for i, v in enumerate(rng.uniform(1, 200, 30)):
+            rows.append(_manifest_row(src, f"{src}_p{i}", float(v)))
+    for i, v in enumerate(np.concatenate([rng.uniform(0, 5, 10), rng.uniform(195, 200, 10)])):
+        rows.append(_manifest_row("s_test_a", f"a_p{i}", float(v)))
+    for i, v in enumerate(rng.uniform(0, 5, 20)):
+        rows.append(_manifest_row("s_test_b", f"b_p{i}", float(v)))
+    manifest = pd.DataFrame(rows)
+    ssl_df, hand_df = _feature_frames(manifest, seed=5)
+
+    project = _project(tmp_path, manifest, split_rows={
+        "source_id": ["s1", "s2", "s_test_a", "s_test_b"],
+        "split": ["train", "val", "test", "test"],
+    })
+
+    probe = T.crystallinity_probe(project, "g", ssl_df, hand_df, METADATA_COLS, 0.85, 0.35)
+    assert probe is not None
+    row = probe.iloc[0]
+    assert row["protocol"] == "encoder-held-out"
+    eval_sources = row["eval_sources"].split(";")
+    assert eval_sources == ["s_test_a"]
+    assert int(row["folds"]) == 1
+
+
 def test_thresholds_use_full_pool_without_any_split(tmp_path):
     # No split_manifest.csv at all: this is the plain LOSO path, where using
     # the full pool was always correct and must remain so.
