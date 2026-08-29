@@ -402,3 +402,18 @@ DM4/signal.
 For a publishable study, add more independently acquired DM4 source images,
 preferably across specimens, sessions and/or acquisition conditions that match the
 scientific generalization claim.
+
+## Development process
+
+This codebase was developed interactively with **Claude Opus 5** (Anthropic)
+via Claude Code, which is why commits carry a `Co-Authored-By: Claude Opus 5`
+trailer. Every change was additionally passed through an automated review by
+**Codex CLI** (OpenAI, `gpt-5.6-sol`), run against the diff introduced in each
+turn; where Codex flagged a defect, the fix was implemented, re-reviewed, and
+the cycle repeated until no further issues were raised. Findings that shaped
+the final design include the Bragg-score algorithm's Nyquist clamping and
+round-trip rounding safeguards, the crystallinity probe's held-out-source
+threshold fitting, and several viewer correctness fixes.
+
+Human review, direction, and final acceptance of every change came from the
+repository owner throughout.
