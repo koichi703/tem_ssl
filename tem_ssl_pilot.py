@@ -791,9 +791,16 @@ class PatchDataset:
                 x = x + sigma * torch.randn_like(x)
 
             if random.random() < 0.2:
+                # Mild isotropic Gaussian blur.
+                # A scalar sigma applies the same smoothing in x and y,
+                # avoiding artificial directional anisotropy in TEM lattice images.
                 ksize = random.choice([3, 5])
-                x = TF.gaussian_blur(x, kernel_size=[ksize, ksize],
-                                     sigma=[0.2, 1.0])
+                sigma = random.uniform(0.2, 1.0)
+                x = TF.gaussian_blur(
+                    x,
+                    kernel_size=[ksize, ksize],
+                    sigma=sigma,
+                )
 
         x = torch.clamp(x, 0.0, 1.0)
         return self._normalize_tensor(x)
