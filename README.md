@@ -5,6 +5,21 @@ self-supervised-learning dataset.
 
 ## Scientific design
 
+| Internal key | Display label | Default patch FOV |
+|---|---|---:|
+| `scale_1` | S1 — Atomic-scale view | 4 nm |
+| `scale_2` | S2 — Local nanoscale view | 15 nm |
+| `scale_3` | S3 — Extended nanoscale view | 100 nm |
+| `scale_4` | S4 — Micron-scale view | 1000 nm（1 µm） |
+
+> S1–S4 are observation-scale groups defined by physical pixel size and
+> target patch field of view. They do not represent independently measured
+> microscope resolution, image quality, crystallinity, phase, or material
+> class.
+
+`Atomic-scale view` describes the *physical field of view* targeted by that
+group's patches, not a guarantee that atoms are resolved in every patch.
+
 The pipeline does **not** mix all magnifications blindly.
 
 1. Read DM4 physical pixel size with HyperSpy.
@@ -22,18 +37,19 @@ The default configuration below was chosen as a pilot for one DM4 series;
 adjust `pilot_config.json`'s scale-group thresholds for your own material
 and magnification range:
 
-- `lattice`: ≤ 0.0125 nm/pixel, 4 nm field-of-view patches
-- `nano`: ≤ 0.05 nm/pixel, 15 nm patches
-- `meso`: ≤ 0.5 nm/pixel, 100 nm patches
-- `micro`: > 0.5 nm/pixel, 1000 nm patches
+- `scale_1` (S1): ≤ 0.0125 nm/pixel, 4 nm field-of-view patches
+- `scale_2` (S2): ≤ 0.05 nm/pixel, 15 nm patches
+- `scale_3` (S3): ≤ 0.5 nm/pixel, 100 nm patches
+- `scale_4` (S4): > 0.5 nm/pixel, 1000 nm patches
 
 The important point is not the names themselves; it is that each SSL model sees
 patches representing comparable physical scales.
 
 **`scale_group` is an observation-scale bucket, not a crystallinity or material
-class.** `lattice` means "imaged at atomic-scale physical resolution," not
-"crystalline" -- an amorphous region imaged at 0.007 nm/pixel is still
-`lattice`. The pipeline does not split training or models by crystallinity;
+class.** `scale_1` means "sampled at ≤ 0.0125 nm/pixel with a 4 nm patch field
+of view," not "crystalline," and not "atomic detail is resolved" -- an
+amorphous region imaged at 0.007 nm/pixel is still `scale_1`. The pipeline
+does not split training or models by crystallinity;
 one SSL encoder per scale group sees both crystalline and amorphous patches
 together, by design, so the representation is not told in advance which is
 which. Bragg-score bands (below) are a separate, viewer-side reading of a
@@ -85,7 +101,7 @@ by design.
    default), clamped to 90% of the *acquisition* Nyquist frequency rather
    than the resampled 224 px grid's -- so an upsampled patch can't have
    interpolation ringing mistaken for a reflection, and a scale group too
-   coarse to resolve that d-spacing (`meso`, `micro`, or any individual
+   coarse to resolve that d-spacing (`scale_3`, `scale_4`, or any individual
    source whose pixel size makes the band unusable) reports **no score at
    all**: `bragg_ratio`, `bragg_d_nm`, and `bragg_pixels` all come back as
    `NaN`, never as a measured-looking `0.0`, so an unresolvable patch is
@@ -194,30 +210,30 @@ Subfolders are searched recursively.
 ```bash
 python tem_ssl_pilot.py prepare \
   ~/TEM_data \
-  ~/TEM_SSL_pilot
+  ~/TEM_SSL_pilot_S1_S4
 ```
 
 Outputs:
 
 ```text
-~/TEM_SSL_pilot/
+~/TEM_SSL_pilot_S1_S4/
 ├── dataset/
 │   ├── manifest.csv
 │   ├── sources.csv
 │   ├── prepare_status.csv
 │   ├── metadata/
 │   └── patches/
-│       ├── lattice/
-│       ├── nano/
-│       ├── meso/
-│       └── micro/
+│       ├── scale_1/
+│       ├── scale_2/
+│       ├── scale_3/
+│       └── scale_4/
 └── pilot_config_used.json
 ```
 
 Inspect:
 
 ```bash
-column -s, -t < ~/TEM_SSL_pilot/dataset/sources.csv | less -S
+column -s, -t < ~/TEM_SSL_pilot_S1_S4/dataset/sources.csv | less -S
 ```
 
 ## 4. Train self-supervised models
@@ -226,7 +242,7 @@ Pilot run:
 
 ```bash
 python tem_ssl_pilot.py train \
-  ~/TEM_SSL_pilot \
+  ~/TEM_SSL_pilot_S1_S4 \
   --all-eligible \
   --epochs 10 \
   --batch-size 64
@@ -237,12 +253,12 @@ A more serious pilot can use 50–100 epochs after confirming that the pipeline 
 Groups with fewer than three independent source files are automatically skipped,
 because a source-level train/validation/test split cannot be created.
 
-To train only the lattice group:
+To train only the S1 group:
 
 ```bash
 python tem_ssl_pilot.py train \
-  ~/TEM_SSL_pilot \
-  --groups lattice \
+  ~/TEM_SSL_pilot_S1_S4 \
+  --groups scale_1 \
   --epochs 20
 ```
 
@@ -250,14 +266,14 @@ python tem_ssl_pilot.py train \
 
 ```bash
 python tem_ssl_pilot.py extract \
-  ~/TEM_SSL_pilot \
+  ~/TEM_SSL_pilot_S1_S4 \
   --all-trained
 ```
 
 Outputs under `features/` include:
 
-- `ssl_embeddings_lattice.csv`
-- `handcrafted_lattice.csv`
+- `ssl_embeddings_scale_1.csv`
+- `handcrafted_scale_1.csv`
 - corresponding files for other trained scale groups
 
 The SSL vector is the 512-D ResNet-18 encoder output, not the projection-head vector.
@@ -266,7 +282,7 @@ The SSL vector is the 512-D ResNet-18 encoder output, not the projection-head ve
 
 ```bash
 python tem_ssl_pilot.py analyze \
-  ~/TEM_SSL_pilot \
+  ~/TEM_SSL_pilot_S1_S4 \
   --all-extracted
 ```
 
@@ -292,7 +308,7 @@ a particular field of view.
 ## 7. Browser viewer
 
 ```bash
-streamlit run viewer.py -- ~/TEM_SSL_pilot
+streamlit run viewer.py -- ~/TEM_SSL_pilot_S1_S4
 ```
 
 Then open the address shown by Streamlit, normally:
@@ -301,9 +317,11 @@ Then open the address shown by Streamlit, normally:
 http://localhost:8501
 ```
 
-The sidebar picks the **observation scale** (`lattice`, `nano`, `meso`,
-`micro`, shown as e.g. "High-resolution / atomic scale (lattice)" rather
-than the raw key) and, when a crystallinity probe is available, a
+The sidebar picks the **observation scale** (`scale_1`..`scale_4`, shown in
+S1..S4 order as e.g. "S1 — Atomic-scale view (4 nm FOV)" rather than the raw
+key -- the FOV shown is read from the running project's own
+`pilot_config_used.json`/manifest, not a fixed value) and, when a
+crystallinity probe is available, a
 **Bragg-score band filter** (High / Ambiguous / Low, plus an "unscored"
 option) that applies to the **Patches tab and both PCA scatters**. The
 unscored option matters for a scale group that mixes scorable and

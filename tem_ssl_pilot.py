@@ -304,7 +304,7 @@ def azimuthal_bragg_score(
     directly comparable across sources within a scale group.
 
     The band is clamped to 90% of the patch Nyquist frequency, so a coarse
-    group (meso/micro) whose pixels cannot resolve d_min_nm reports no score
+    group (scale_3/scale_4) whose pixels cannot resolve d_min_nm reports no score
     at all (NaN in every field) rather than measuring noise or being mistaken
     for a genuinely low, measured value.
     """

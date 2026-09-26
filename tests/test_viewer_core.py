@@ -1,4 +1,5 @@
 """Tests for the viewer's pure helpers (no Streamlit involved)."""
+import json
 import sys
 from pathlib import Path
 
@@ -12,10 +13,10 @@ import viewer_core as vc
 
 # ---------------------------------------------------------------- labels
 def test_known_scale_groups_get_observation_scale_labels():
-    assert vc.scale_group_label("lattice") == "High-resolution / atomic scale (lattice)"
-    for key in ("nano", "meso", "micro"):
+    assert vc.scale_group_label("scale_1") == "S1 — Atomic-scale view"
+    for key, short in (("scale_2", "S2"), ("scale_3", "S3"), ("scale_4", "S4")):
         label = vc.scale_group_label(key)
-        assert key in label and label != key
+        assert label.startswith(short) and label != key
 
 
 def test_unknown_and_empty_scale_groups_do_not_raise():
@@ -27,6 +28,64 @@ def test_labels_never_claim_a_phase():
     joined = " ".join(vc.SCALE_GROUP_LABELS.values()).lower()
     for word in ("crystal", "amorphous", "結晶", "非晶"):
         assert word not in joined
+
+
+def test_display_order_is_s1_to_s4_not_alphabetical():
+    shuffled = ["scale_3", "scale_1", "scale_4", "scale_2"]
+    assert vc.sort_scale_groups(shuffled) == ["scale_1", "scale_2", "scale_3", "scale_4"]
+
+
+def test_display_order_puts_unknown_groups_after_known_ones():
+    assert vc.sort_scale_groups(["zzz", "scale_2", "scale_1", "aaa"]) == [
+        "scale_1", "scale_2", "aaa", "zzz",
+    ]
+
+
+def test_fov_label_uses_running_project_value_not_a_hardcoded_one():
+    assert vc.scale_group_label("scale_1", patch_fov_nm=4.0) == "S1 — Atomic-scale view (4 nm FOV)"
+    # A user-edited patch_fov_nm must be reflected, not a fixed default.
+    assert vc.scale_group_label("scale_1", patch_fov_nm=6.5) == "S1 — Atomic-scale view (6.5 nm FOV)"
+
+
+def test_fov_label_omitted_when_fov_unavailable():
+    assert vc.scale_group_label("scale_1") == "S1 — Atomic-scale view"
+    assert vc.scale_group_label("scale_1", patch_fov_nm=None) == "S1 — Atomic-scale view"
+    assert vc.scale_group_label("scale_1", patch_fov_nm=float("nan")) == "S1 — Atomic-scale view"
+
+
+def test_fov_1000nm_and_above_reads_as_micrometres():
+    assert vc.format_fov_nm(1000.0) == "1 µm"
+    assert vc.format_fov_nm(1500.0) == "1.5 µm"
+    assert vc.format_fov_nm(100.0) == "100 nm"
+    assert vc.format_fov_nm(4.0) == "4 nm"
+
+
+def test_fov_lookup_from_config_used_json(tmp_path):
+    config = {
+        "scale_groups": [
+            {"name": "scale_1", "patch_fov_nm": 4.0},
+            {"name": "scale_4", "patch_fov_nm": 1000.0},
+        ]
+    }
+    p = tmp_path / "pilot_config_used.json"
+    p.write_text(json.dumps(config))
+    loaded = vc.read_json_config(p)
+    assert vc.fov_lookup_from_config(loaded) == {"scale_1": 4.0, "scale_4": 1000.0}
+
+
+def test_read_json_config_missing_file_is_none(tmp_path):
+    assert vc.read_json_config(tmp_path / "does_not_exist.json") is None
+    assert vc.fov_lookup_from_config(None) == {}
+
+
+def test_fov_from_manifest_reads_running_projects_value():
+    manifest = pd.DataFrame({
+        "scale_group": ["scale_1", "scale_1", "scale_2"],
+        "patch_fov_nm": [4.0, 4.0, 15.0],
+    })
+    assert vc.fov_from_manifest(manifest, "scale_1") == 4.0
+    assert vc.fov_from_manifest(manifest, "scale_2") == 15.0
+    assert vc.fov_from_manifest(manifest, "scale_3") is None
 
 
 def test_band_names_are_score_bands_not_phase_labels():
@@ -145,7 +204,7 @@ def test_attach_joins_by_patch_id_without_duplicating_rows():
 
 def test_attach_is_a_noop_without_the_columns_or_key():
     pca = pd.DataFrame({"patch_id": ["a"], "PC1": [1.0]})
-    old = pd.DataFrame({"patch_id": ["a"], "scale_group": ["lattice"]})
+    old = pd.DataFrame({"patch_id": ["a"], "scale_group": ["scale_1"]})
     assert list(vc.attach_bragg_columns(pca, old).columns) == ["patch_id", "PC1"]
     nokey = pd.DataFrame({"PC1": [1.0]})
     assert list(vc.attach_bragg_columns(nokey, _manifest()).columns) == ["PC1"]
