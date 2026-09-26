@@ -10,28 +10,28 @@
   "seed": 42,
   "scale_groups": [
     {
-      "name": "lattice",
+      "name": "scale_1",
       "max_nm_per_pixel": 0.0125,
       "patch_fov_nm": 4.0,
-      "description": "HRTEM / lattice-scale images"
+      "description": "S1: atomic-scale view"
     },
     {
-      "name": "nano",
+      "name": "scale_2",
       "max_nm_per_pixel": 0.05,
       "patch_fov_nm": 15.0,
-      "description": "nanoscale particle / local morphology"
+      "description": "S2: local nanoscale view"
     },
     {
-      "name": "meso",
+      "name": "scale_3",
       "max_nm_per_pixel": 0.5,
       "patch_fov_nm": 100.0,
-      "description": "aggregate-scale morphology"
+      "description": "S3: extended nanoscale view"
     },
     {
-      "name": "micro",
+      "name": "scale_4",
       "max_nm_per_pixel": null,
       "patch_fov_nm": 1000.0,
-      "description": "low-magnification micrometre-scale morphology"
+      "description": "S4: micron-scale view"
     }
   ]
 }

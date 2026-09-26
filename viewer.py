@@ -41,15 +41,28 @@ if not manifest_path.exists():
 manifest = pd.read_csv(manifest_path)
 sources = pd.read_csv(sources_path) if sources_path.exists() else pd.DataFrame()
 
-groups = sorted(manifest["scale_group"].dropna().astype(str).unique())
+groups = vc.sort_scale_groups(manifest["scale_group"].dropna().astype(str).unique())
 if not groups:
     st.error("scale_group が manifest.csv に見つかりません。")
     st.stop()
 
+# FOV shown next to each group's label is read from the running project, not
+# hardcoded, so it stays correct if the user edited patch_fov_nm for their
+# own data. pilot_config_used.json wins when present; the manifest's own
+# patch_fov_nm column is the fallback for older projects.
+_config_used = vc.read_json_config(project / "pilot_config_used.json")
+_fov_by_group = vc.fov_lookup_from_config(_config_used)
+
+
+def _group_label(g: str) -> str:
+    fov = _fov_by_group.get(g, vc.fov_from_manifest(manifest, g))
+    return vc.scale_group_label(g, fov)
+
+
 group = st.sidebar.selectbox(
     "Observation scale",
     groups,
-    format_func=vc.scale_group_label,
+    format_func=_group_label,
 )
 st.sidebar.caption(vc.SCALE_GROUP_NOTE)
 
@@ -186,7 +199,7 @@ def render_patch_grid(
 
 
 with tab1:
-    st.caption(f"Observation scale: **{vc.scale_group_label(group)}**")
+    st.caption(f"Observation scale: **{_group_label(group)}**")
     if bands_on and len(gdf_view) != len(gdf):
         st.caption(
             f"Bragg score band で絞り込み中: {len(gdf_view)} / {len(gdf)} パッチ"

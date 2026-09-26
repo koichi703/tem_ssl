@@ -13,6 +13,7 @@ assignment -- see ``BRAGG_CAVEAT``.
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,31 +24,141 @@ import pandas as pd
 # ---------------------------------------------------------------------
 # Scale groups
 # ---------------------------------------------------------------------
-# `scale_group` records the physical sampling scale a patch was cropped at.
-# It says nothing about crystallinity or material class -- an amorphous region
-# imaged at 0.007 nm/pixel is still "lattice". The internal keys are part of
-# the on-disk layout (directory names, CSV values) and must not change, so the
-# rewording lives here, in the display layer only.
+# `scale_group` records the observation-scale group (physical pixel size /
+# target patch field of view) a patch was cropped at. S1-S4 say nothing about
+# independently measured microscope resolution, image quality, crystallinity,
+# phase, or material class -- an amorphous region imaged at S1's pixel size
+# is still "scale_1". The internal keys (`scale_1`..`scale_4`) are part of the
+# on-disk layout (directory names, CSV values) and must not change, so the
+# rewording lives here, in the display layer only. Display order follows
+# SCALE_GROUP_ORDER, never the internal keys' dictionary/alphabetical order.
+SCALE_GROUP_ORDER: tuple[str, ...] = (
+    "scale_1",
+    "scale_2",
+    "scale_3",
+    "scale_4",
+)
+
 SCALE_GROUP_LABELS: dict[str, str] = {
-    "lattice": "High-resolution / atomic scale (lattice)",
-    "nano": "Nanoscale morphology (nano)",
-    "meso": "Aggregate / mesoscale morphology (meso)",
-    "micro": "Low-magnification / micrometre scale (micro)",
+    "scale_1": "S1 — Atomic-scale view",
+    "scale_2": "S2 — Local nanoscale view",
+    "scale_3": "S3 — Extended nanoscale view",
+    "scale_4": "S4 — Micron-scale view",
 }
 
 SCALE_GROUP_NOTE = (
-    "scale_group は観察スケール（物理ピクセルサイズ）の区分です。"
-    "結晶性や材質のクラスではありません —— 同じ lattice 群にも"
+    "S1–S4 are observation-scale groups defined by physical pixel size and "
+    "target patch field of view. They do not represent independently "
+    "measured microscope resolution, image quality, crystallinity, phase, "
+    "or material class. "
+    "scale_group は観察スケール（物理ピクセルサイズと目標patch視野）の区分です。"
+    "結晶性や材質のクラスではありません —— 同じ観察スケール群にも"
     "格子縞の見えるパッチと非晶質のパッチが混在します。"
 )
 
 
-def scale_group_label(group: Any) -> str:
-    """Human-readable name for a scale-group key; unknown keys pass through."""
+def format_fov_nm(value: Any) -> str | None:
+    """
+    Human-readable field-of-view string ("4 nm", "1 µm"), or None when
+    `value` is missing, non-finite, or non-positive.
+
+    1000 nm and above switch to µm for readability; below that, nm. Decimals
+    beyond what distinguishes the value are trimmed rather than shown, so a
+    config's exact 4.0 reads as "4 nm", not "4.00 nm".
+    """
+    try:
+        nm = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(nm) or nm <= 0:
+        return None
+
+    def trim(x: float) -> str:
+        rounded = round(x, 2)
+        if rounded == int(rounded):
+            return str(int(rounded))
+        return f"{rounded:.2f}".rstrip("0").rstrip(".")
+
+    if nm >= 1000:
+        return f"{trim(nm / 1000.0)} µm"
+    return f"{trim(nm)} nm"
+
+
+def scale_group_label(group: Any, patch_fov_nm: Any = None) -> str:
+    """
+    Human-readable name for a scale-group key; unknown keys pass through.
+
+    When `patch_fov_nm` resolves to a usable value, it is appended as
+    "(<fov> FOV)" -- callers should pass the *running project's* FOV (from
+    `pilot_config_used.json` or the manifest), never a value hardcoded here,
+    so the label stays correct if the user edited `patch_fov_nm` for their
+    own data.
+    """
     key = "" if group is None else str(group)
-    if key in SCALE_GROUP_LABELS:
-        return SCALE_GROUP_LABELS[key]
-    return f"Observation scale ({key})" if key else "Observation scale"
+    base = SCALE_GROUP_LABELS.get(
+        key, f"Observation scale ({key})" if key else "Observation scale"
+    )
+    fov = format_fov_nm(patch_fov_nm)
+    return f"{base} ({fov} FOV)" if fov is not None else base
+
+
+def sort_scale_groups(groups: Iterable[Any]) -> list[str]:
+    """
+    Scale-group keys ordered S1..S4 first, then any unknown/custom keys in
+    alphabetical order. Never raises on an unrecognised key, matching the
+    viewer's existing tolerance for custom scale groups.
+    """
+    keys = [str(g) for g in groups]
+    rank = {k: i for i, k in enumerate(SCALE_GROUP_ORDER)}
+    known = sorted((k for k in keys if k in rank), key=lambda k: rank[k])
+    unknown = sorted(k for k in keys if k not in rank)
+    return known + unknown
+
+
+def read_json_config(path: str | Path) -> dict[str, Any] | None:
+    """Parsed JSON config, or None when missing, empty, or unparseable."""
+    try:
+        p = Path(path)
+        if not p.is_file() or p.stat().st_size == 0:
+            return None
+        with p.open(encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def fov_lookup_from_config(config: dict[str, Any] | None) -> dict[str, float]:
+    """Map scale-group name -> patch_fov_nm, read from a pilot_config dict."""
+    out: dict[str, float] = {}
+    if not isinstance(config, dict):
+        return out
+    for group in config.get("scale_groups", None) or []:
+        if not isinstance(group, dict) or group.get("name") is None:
+            continue
+        try:
+            fov = float(group.get("patch_fov_nm"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fov) and fov > 0:
+            out[str(group["name"])] = fov
+    return out
+
+
+def fov_from_manifest(
+    manifest: pd.DataFrame | None,
+    group: Any,
+    fov_col: str = "patch_fov_nm",
+    group_col: str = "scale_group",
+) -> float | None:
+    """First finite `fov_col` value recorded for `group` in `manifest`."""
+    if (manifest is None or not isinstance(manifest, pd.DataFrame)
+            or fov_col not in manifest.columns or group_col not in manifest.columns):
+        return None
+    sub = manifest.loc[manifest[group_col].astype(str) == str(group), fov_col]
+    vals = pd.to_numeric(sub, errors="coerce")
+    vals = vals[np.isfinite(vals.to_numpy(dtype="float64", na_value=np.nan))]
+    return float(vals.iloc[0]) if len(vals) else None
 
 
 # ---------------------------------------------------------------------
